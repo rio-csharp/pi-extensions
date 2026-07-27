@@ -81,6 +81,19 @@ cp -R extensions/. "$AGENT/extensions/"
 
 Run `/reload` in Pi after copying the files.
 
+## Development setup with junctions
+
+To avoid maintaining a separate runtime copy and repository copy, this checkout can be the source of truth. On Windows, create directory junctions from selected paths under `~/.pi/agent/` to the matching repository paths. Pi then runs exactly the files tracked by Git.
+
+Junctions keep the runtime and local Git working tree synchronized, but they do not publish changes automatically. Review and publish local changes explicitly:
+
+```powershell
+Set-Location D:\Development\pi-extensions
+.\scripts\publish.ps1 "Describe the extension changes"
+```
+
+The publish script fetches `origin`, refuses to push when the remote branch is ahead, checks staged paths and common credential patterns, commits pending changes, and pushes `main`. Always inspect `git diff` as part of your review; automated secret checks are only a safeguard.
+
 ## Configuration examples
 
 Examples are in `config-examples/`. They are safe templates only:
