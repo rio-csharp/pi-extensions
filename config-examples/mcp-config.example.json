@@ -1,0 +1,13 @@
+{
+  "servers": {
+    "example": {
+      "name": "example",
+      "url": "https://example.com/mcp",
+      "transport": "http",
+      "scope": "user",
+      "enabled": false,
+      "authType": "none",
+      "oauthConfig": {}
+    }
+  }
+}

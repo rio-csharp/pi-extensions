@@ -1,0 +1,21 @@
+{
+  "providers": [
+    {
+      "id": "your-provider-id",
+      "name": "Your Provider",
+      "baseUrl": "https://your-provider.example/v1",
+      "apiKey": "PASTE_YOUR_API_KEY_HERE",
+      "api": "openai-completions",
+      "hidden": false,
+      "models": [
+        {
+          "id": "your-model-id",
+          "hidden": false,
+          "reasoning": true,
+          "contextWindow": 128000,
+          "maxTokens": 16384
+        }
+      ]
+    }
+  ]
+}

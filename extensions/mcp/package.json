@@ -1,0 +1,31 @@
+{
+  "name": "pi-mcp-extension",
+  "version": "1.0.0",
+  "description": "Model Context Protocol (MCP) extension for Pi coding agent",
+  "main": "index.ts",
+  "scripts": {
+    "test": "tsc --noEmit --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck index.ts"
+  },
+  "keywords": [
+    "pi",
+    "mcp",
+    "model-context-protocol",
+    "extension"
+  ],
+  "author": "",
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "^0.82.1",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "typebox": "^1.3.8"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typescript": "^5.9.3"
+  }
+}

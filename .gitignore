@@ -1,0 +1,27 @@
+# Dependencies and generated files
+node_modules/
+dist/
+*.log
+
+# Private Pi state and credentials
+.pi/
+sessions/
+auth.json
+.credentials.json
+models-store.json
+relay-providers.json
+mcp-config.json
+settings.json
+
+# Local/private variants
+*.local.json
+*.private.json
+.env
+.env.*
+!.env.example
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
