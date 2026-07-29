@@ -1,6 +1,6 @@
-# Node modules and generated dependency lock
+# Installed and test-generated dependencies/artifacts
 node_modules/
-package-lock.json
+.test-dist/
 
 # Logs
 *.log

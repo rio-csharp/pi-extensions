@@ -10,12 +10,12 @@ A Pi extension that connects remote Model Context Protocol servers through the s
 - OAuth 2.1 authorization-code flow with PKCE
 - Persistent OAuth identity with refresh-token renewal
 - Dedicated `~/.pi/agent/.credentials.json` credential store
-- Bearer-token authentication
+- Bearer-token authentication through environment-variable references (no plaintext terminal prompt)
 - Automatic tool and resource discovery
 - Immediate tool deactivation when a server is disabled or removed
 - Cached tool restoration during `/reload`
 - Background MCP reconnection during `/reload`
-- Paginated tool and resource discovery
+- Bounded paginated tool and resource discovery
 - Secure configuration-file permissions
 
 Only Streamable HTTP is currently supported. Stdio servers are not supported.
@@ -28,11 +28,13 @@ The extension is auto-discovered from:
 ~/.pi/agent/extensions/mcp/index.ts
 ```
 
-Install its dependencies from the extension directory:
+Install its pinned runtime dependencies from the extension directory:
 
 ```bash
-npm install
+npm ci --omit=dev
 ```
+
+Contributors who need the TypeScript validation script should run `npm ci` without `--omit=dev`.
 
 Reload Pi after changing the extension:
 
@@ -45,7 +47,7 @@ Reload Pi after changing the extension:
 Add an OAuth-protected user-scoped server:
 
 ```text
-/mcp add --transport http --scope user cafe https://api.codes.cafe/mcp --auth oauth
+/mcp add --transport http --scope user private https://mcp.example.com/mcp --auth oauth
 ```
 
 If authentication is required, Pi asks whether to open the browser. Authentication can also be started explicitly:
@@ -83,22 +85,31 @@ Options:
 - `--auth none` — no authentication; this is the default.
 - `--auth oauth` — use OAuth discovery and PKCE.
 - `--auth bearer` — use a bearer token.
-- `--oauth-scope <scope>` — request an explicit OAuth scope.
-- `--token <token>` — set an initial bearer token.
+- `--bearer-token-env <ENV_VAR>` — read a bearer token from this environment variable at connection time.
+- `--oauth-scope <scope>` — request an explicit OAuth scope (OAuth servers only).
+
+Bearer tokens are intentionally rejected in command text and are not requested with `ctx.ui.input`. Pi 0.82.1's ordinary extension UI exposes only unmasked `input`. Although the separate model-provider auth contract accepts a `type: "secret"` hint, Pi 0.82.1's TUI routes that hint to the normal `Input` component and even replaces it with the submitted plaintext afterward; it is not a supported masked input facility for this extension. Configure bearer servers with an environment-variable reference instead.
 
 Examples:
 
 ```text
 /mcp add --transport http --scope user public https://example.com/mcp
-/mcp add --transport http --scope user cafe https://api.codes.cafe/mcp --auth oauth
-/mcp add --transport http --scope project internal https://example.com/mcp --auth bearer
+/mcp add --transport http --scope user private https://mcp.example.com/mcp --auth oauth
+/mcp add --transport http --scope project internal https://example.com/mcp --auth bearer --bearer-token-env INTERNAL_MCP_TOKEN
 ```
 
-For bearer authentication, prefer entering the token interactively instead of including it in command text:
+For bearer authentication, set the referenced variable in the environment that launches Pi, then connect:
+
+```bash
+export INTERNAL_MCP_TOKEN='...'
+pi
+```
 
 ```text
-/mcp auth internal
+/mcp connect internal
 ```
+
+On PowerShell, set `$env:INTERNAL_MCP_TOKEN = '...'` before starting Pi. `/mcp auth internal` only explains this setup; it never opens an unmasked token prompt. Environment variables can be inspected by same-user processes on some operating systems, so for high-value credentials launch Pi from a secret manager (for example, a password-manager CLI that injects an ephemeral environment) and avoid shell history.
 
 ### Connect or refresh discovery
 
@@ -114,7 +125,7 @@ This reconnects the server and refreshes its cached tools and resources.
 /mcp auth <name>
 ```
 
-- Bearer servers prompt for a token.
+- Bearer servers show the configured environment-variable setup; they never prompt for plaintext secrets.
 - Other servers are switched to OAuth and start the browser authorization flow.
 
 ### Enable or disable
@@ -191,7 +202,7 @@ The configuration files store server definitions, discovered tool/resource metad
 ~/.pi/agent/.credentials.json
 ```
 
-The credential store uses a Claude-style `mcpOAuth` map keyed by server name and a hash of the server URL. It contains OAuth client registration, access/refresh tokens, token expiry, PKCE state while authentication is in progress, and cached OAuth discovery metadata. Bearer tokens are stored in the adjacent `mcpBearer` map. Existing credentials embedded in `mcp-config.json` are migrated automatically on startup.
+The credential store uses a Claude-style `mcpOAuth` map keyed by server name and a hash of the server URL. It contains OAuth client registration, access/refresh tokens, token expiry, PKCE state while authentication is in progress, and cached OAuth discovery metadata. Existing embedded bearer tokens are migrated to the adjacent `mcpBearer` map for backward compatibility, but newly configured bearer credentials use `bearerTokenEnv` and are never persisted by this extension.
 
 ## OAuth behavior
 
@@ -253,13 +264,15 @@ Discovered tools are registered in Pi using this format:
 mcp_<server-name>_<remote-tool-name>
 ```
 
-Unsupported characters are replaced with underscores.
+Unsupported characters are replaced with underscores. Because different remote names can normalize to the same value, the extension detects collisions against other MCP tools and all tools Pi exposes through `pi.getAllTools()`. Colliding names receive a stable hash suffix instead of silently overriding an existing tool.
 
 If a server exposes resources, the extension also registers:
 
 ```text
 mcp_<server-name>_read_resource
 ```
+
+The synthetic resource reader participates in the same collision check. For example, a remote tool literally named `read_resource` and the synthetic resource reader get distinct registered names.
 
 ## Startup and reload behavior
 
@@ -271,20 +284,28 @@ Pi startup and `/reload` do not wait for MCP network requests:
 4. A cached tool invoked during reconnection waits for that in-flight attempt instead of starting a duplicate connection.
 5. Pending transports are cancelled if another reload, session switch, or shutdown occurs.
 
-Connection, tool-discovery, and resource-discovery requests time out after 15 seconds by default. Set `PI_MCP_REQUEST_TIMEOUT_MS` to a positive millisecond value to override this limit.
+Connection, tool-discovery, and resource-discovery requests time out after 15 seconds by default. Set `PI_MCP_REQUEST_TIMEOUT_MS` to a positive millisecond value to override this limit. Metadata discovery is capped at 100 pages and 10,000 tools/resources per collection; repeated cursors are rejected.
 
 ## Security
 
 The MCP credential store contains secrets.
 
 - Never commit `~/.pi/agent/.credentials.json` or a legacy configuration containing OAuth/bearer tokens.
-- Prefer `/mcp auth <name>` over placing a token in command text.
+- For bearer auth, use `--bearer-token-env`; never place a token in command text.
 - Project configuration no longer contains newly entered credentials; legacy embedded credentials are migrated automatically.
 - The extension applies mode `0600` on Unix-like systems to both configuration and credential files.
 - On Windows, it restricts both files' ACLs to the current user, SYSTEM, and Administrators.
+- MCP endpoints must use HTTPS. Plain HTTP is accepted only for numeric loopback addresses in `127.0.0.0/8` or `::1`; `localhost`, private LAN addresses, and public hosts require HTTPS. This preserves local development without permitting bearer/OAuth credentials over a cleartext network.
+- Legitimate private-network MCP servers are supported over HTTPS, including private DNS names and RFC 1918/ULA addresses. Configure a certificate trusted by Node/Pi; there is deliberately no insecure TLS bypass.
+- OAuth discovery, authorization, registration, token, JWKS/userinfo metadata, redirects, and browser launch use the same HTTPS-or-strict-loopback policy and reject URL userinfo. Cached discovery metadata is revalidated before use.
+- Remote names, descriptions, progress messages, resource metadata, and errors are stripped of terminal controls/bidi formatting before TUI or notification display.
 - Review MCP servers before enabling their tools; MCP tools can perform remote actions.
 
 ## Troubleshooting
+
+### HTTP endpoint rejected
+
+Use HTTPS for network endpoints. Plain HTTP is only supported for numeric loopback URLs such as `http://127.0.0.1:3000/mcp` or `http://[::1]:3000/mcp`; use TLS for `localhost`, LAN, VPN, and public endpoints.
 
 ### HTTP 404 on `/tools/list`
 

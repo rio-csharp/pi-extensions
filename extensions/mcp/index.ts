@@ -1,4 +1,10 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  CONFIG_DIR_NAME,
+  DEFAULT_MAX_BYTES,
+  DEFAULT_MAX_LINES,
+  type ExtensionAPI,
+  truncateHead,
+} from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -14,10 +20,13 @@ import {
   type OAuthDiscoveryState,
 } from "@modelcontextprotocol/sdk/client/auth.js";
 import type {
+  AuthorizationServerMetadata,
   OAuthClientInformationMixed,
   OAuthClientMetadata,
+  OAuthProtectedResourceMetadata,
   OAuthTokens,
 } from "@modelcontextprotocol/sdk/shared/auth.js";
+import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { createServer, type Server as HttpServer } from "node:http";
 import { readFile, writeFile, mkdir, access, chmod } from "node:fs/promises";
 import { join, dirname } from "node:path";
@@ -32,6 +41,10 @@ const OAUTH_CALLBACK_PORT = 33418;
 const OAUTH_CALLBACK_PATH = "/oauth/callback";
 const OAUTH_CALLBACK_URL = `http://${OAUTH_CALLBACK_HOST}:${OAUTH_CALLBACK_PORT}${OAUTH_CALLBACK_PATH}`;
 const OAUTH_TIMEOUT_MS = 5 * 60 * 1000;
+const MAX_DISCOVERY_PAGES = 100;
+const MAX_DISCOVERY_ITEMS = 10_000;
+const MAX_HTTP_REDIRECTS = 5;
+const MAX_REMOTE_TEXT_LENGTH = 16_384;
 const parsedRequestTimeout = Number(process.env.PI_MCP_REQUEST_TIMEOUT_MS ?? 15_000);
 const MCP_REQUEST_TIMEOUT_MS = Number.isFinite(parsedRequestTimeout) && parsedRequestTimeout > 0
   ? parsedRequestTimeout
@@ -96,6 +109,8 @@ interface MCPServerConfig {
   scope: "user" | "project";
   enabled: boolean;
   authType?: "none" | "oauth" | "bearer";
+  /** Environment variable read at connection time. Newly configured bearer secrets are never prompted or persisted. */
+  bearerTokenEnv?: string;
   token?: string;
   oauthConfig?: OAuthConfig;
   tools?: MCPTool[];
@@ -124,11 +139,45 @@ class InteractiveAuthorizationRequiredError extends UnauthorizedError {
   }
 }
 
-function getErrorMessage(error: unknown): string {
-  if (error instanceof StreamableHTTPError && error.code) {
-    return `HTTP ${error.code}: ${error.message}`;
+export function sanitizeTerminalText(
+  value: unknown,
+  options: { multiline?: boolean; maxLength?: number } = {},
+): string {
+  const multiline = options.multiline ?? true;
+  const maxLength = options.maxLength ?? MAX_REMOTE_TEXT_LENGTH;
+  let output = "";
+  for (const character of String(value ?? "").normalize("NFC")) {
+    const codePoint = character.codePointAt(0)!;
+    if (character === "\n" || character === "\r") {
+      if (multiline && !output.endsWith("\n")) output += "\n";
+      else if (!multiline && output && !output.endsWith(" ")) output += " ";
+    } else if (character === "\t") {
+      output += multiline ? "  " : " ";
+    } else if (
+      codePoint < 0x20 ||
+      (codePoint >= 0x7f && codePoint <= 0x9f) ||
+      (codePoint >= 0x200b && codePoint <= 0x200f) ||
+      (codePoint >= 0x202a && codePoint <= 0x202e) ||
+      (codePoint >= 0x2060 && codePoint <= 0x206f) ||
+      codePoint === 0xfeff
+    ) {
+      continue;
+    } else {
+      output += character;
+    }
+    if (output.length >= maxLength) return `${output.slice(0, maxLength)}…`;
   }
-  return error instanceof Error ? error.message : String(error);
+  return output;
+}
+
+function getErrorMessage(error: unknown): string {
+  const streamableError = error instanceof StreamableHTTPError
+    ? error as StreamableHTTPError
+    : undefined;
+  const message = streamableError?.code
+    ? `HTTP ${streamableError.code}: ${streamableError.message}`
+    : error instanceof Error ? error.message : String(error);
+  return sanitizeTerminalText(message);
 }
 
 function isFileMissing(error: unknown): boolean {
@@ -137,7 +186,121 @@ function isFileMissing(error: unknown): boolean {
 
 function isUnauthorized(error: unknown): boolean {
   return error instanceof UnauthorizedError ||
-    (error instanceof StreamableHTTPError && error.code === 401);
+    (error instanceof StreamableHTTPError && (error as StreamableHTTPError).code === 401);
+}
+
+export function isStrictLoopbackUrl(url: URL): boolean {
+  const hostname = url.hostname.toLowerCase();
+  if (hostname === "[::1]" || hostname === "::1") return true;
+  const octets = hostname.split(".");
+  return octets.length === 4 && octets.every(octet => /^\d{1,3}$/.test(octet)) &&
+    Number(octets[0]) === 127 && octets.every(octet => Number(octet) <= 255);
+}
+
+export function parseSafeHttpUrl(value: string | URL, purpose = "URL"): URL {
+  let url: URL;
+  try {
+    url = value instanceof URL ? new URL(value.toString()) : new URL(value);
+  } catch {
+    throw new Error(`${purpose} is not a valid absolute URL`);
+  }
+  if (url.protocol !== "https:" && url.protocol !== "http:") {
+    throw new Error(`${purpose} must use HTTPS (HTTP is allowed only for numeric loopback addresses)`);
+  }
+  if (url.username || url.password) throw new Error(`${purpose} must not contain userinfo`);
+  if (url.hash) throw new Error(`${purpose} must not contain a fragment`);
+  if (url.protocol === "http:" && !isStrictLoopbackUrl(url)) {
+    throw new Error(`${purpose} must use HTTPS unless it uses a numeric loopback address (127.0.0.0/8 or ::1)`);
+  }
+  return url;
+}
+
+function parseMcpUrl(value: string): URL {
+  return parseSafeHttpUrl(value, "MCP endpoint");
+}
+
+function validateOAuthDiscoveryState(serverUrl: string, state: OAuthDiscoveryState): void {
+  const server = parseMcpUrl(serverUrl);
+  const authorizationServer = parseSafeHttpUrl(state.authorizationServerUrl, "OAuth authorization server URL");
+  if (state.resourceMetadataUrl) parseSafeHttpUrl(state.resourceMetadataUrl, "OAuth resource metadata URL");
+  validateProtectedResourceMetadata(state.resourceMetadata, server);
+  validateAuthorizationServerMetadata(state.authorizationServerMetadata, authorizationServer);
+}
+
+function validateProtectedResourceMetadata(
+  metadata: OAuthProtectedResourceMetadata | undefined,
+  serverUrl: URL,
+): void {
+  if (!metadata) return;
+  const resource = parseSafeHttpUrl(metadata.resource, "OAuth protected resource URL");
+  if (resource.origin !== serverUrl.origin) {
+    throw new Error("OAuth protected resource metadata does not match the MCP endpoint origin");
+  }
+  for (const value of metadata.authorization_servers ?? []) {
+    parseSafeHttpUrl(value, "OAuth authorization server URL");
+  }
+  for (const key of ["jwks_uri", "resource_documentation", "resource_policy_uri", "resource_tos_uri"] as const) {
+    const value = metadata[key];
+    if (typeof value === "string" && value) parseSafeHttpUrl(value, `OAuth metadata ${key}`);
+  }
+}
+
+function validateAuthorizationServerMetadata(
+  metadata: AuthorizationServerMetadata | undefined,
+  authorizationServerUrl: URL,
+): void {
+  if (!metadata) return;
+  const issuer = parseSafeHttpUrl(metadata.issuer, "OAuth issuer URL");
+  const expectedIssuer = new URL(authorizationServerUrl);
+  issuer.search = "";
+  expectedIssuer.search = "";
+  if (issuer.toString().replace(/\/$/, "") !== expectedIssuer.toString().replace(/\/$/, "")) {
+    throw new Error("OAuth metadata issuer does not match the discovered authorization server");
+  }
+  parseSafeHttpUrl(metadata.authorization_endpoint, "OAuth authorization endpoint");
+  parseSafeHttpUrl(metadata.token_endpoint, "OAuth token endpoint");
+  if (metadata.registration_endpoint) {
+    parseSafeHttpUrl(metadata.registration_endpoint, "OAuth registration endpoint");
+  }
+  if ("userinfo_endpoint" in metadata && typeof metadata.userinfo_endpoint === "string") {
+    parseSafeHttpUrl(metadata.userinfo_endpoint, "OpenID userinfo endpoint");
+  }
+  if ("jwks_uri" in metadata && typeof metadata.jwks_uri === "string") {
+    parseSafeHttpUrl(metadata.jwks_uri, "OAuth JWKS URL");
+  }
+}
+
+const safeFetch: FetchLike = async (input, init = {}) => {
+  let url = parseSafeHttpUrl(input, "Outbound MCP/OAuth URL");
+  let requestInit: RequestInit = { ...init, redirect: "manual" };
+  for (let redirects = 0; ; redirects++) {
+    const response = await fetch(url, requestInit);
+    if (![301, 302, 303, 307, 308].includes(response.status)) return response;
+    const location = response.headers.get("location");
+    await response.body?.cancel();
+    if (!location) throw new Error("HTTP redirect did not include a Location header");
+    if (redirects >= MAX_HTTP_REDIRECTS) throw new Error("Too many HTTP redirects");
+    const method = String(requestInit.method ?? "GET").toUpperCase();
+    const next = parseSafeHttpUrl(new URL(location, url), "HTTP redirect URL");
+    if (next.origin !== url.origin) throw new Error("Refusing cross-origin HTTP redirect");
+    if (method !== "GET" && method !== "HEAD" && response.status !== 307 && response.status !== 308) {
+      throw new Error(`Refusing method-changing HTTP redirect for ${method} request`);
+    }
+    url = next;
+  }
+};
+
+export function normalizedMcpToolName(serverName: string, remoteName: string): string {
+  return `mcp_${serverName}_${remoteName}`.replace(/[^a-zA-Z0-9_]/g, "_");
+}
+
+export function disambiguateToolName(base: string, identity: string, used: Set<string>): string {
+  if (!used.has(base)) return base;
+  const suffix = createHash("sha256").update(identity).digest("hex").slice(0, 10);
+  let candidate = `${base}_${suffix}`;
+  let counter = 2;
+  while (used.has(candidate)) candidate = `${base}_${suffix}_${counter++}`;
+  return candidate;
 }
 
 async function fileExists(path: string): Promise<boolean> {
@@ -150,7 +313,8 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
-async function openBrowser(url: string): Promise<void> {
+async function openBrowser(value: string | URL): Promise<void> {
+  const url = parseSafeHttpUrl(value, "Browser authorization URL").toString();
   if (process.platform === "win32") {
     await execFileAsync("rundll32.exe", ["url.dll,FileProtocolHandler", url]);
   } else if (process.platform === "darwin") {
@@ -169,6 +333,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
   let shuttingDown = false;
   let userConfigPath = "";
   let projectConfigPath = "";
+  let projectConfigEnabled = false;
   let credentialsPath = "";
   let credentials: MCPCredentials = { mcpOAuth: {}, mcpBearer: {} };
   let credentialsWriteQueue: Promise<void> = Promise.resolve();
@@ -208,11 +373,14 @@ export default function mcpExtension(pi: ExtensionAPI) {
     : `${(milliseconds / 1000).toFixed(1)}s`;
 
   const compactValue = (key: string, value: unknown): string => {
+    if (/(?:authorization|token|secret|password|cookie|api[-_]?key|credential|signature)/i.test(key)) {
+      return "<redacted>";
+    }
     if (typeof value === "string") {
       if (value.length > 160 || /(?:content|text|markdown|json|chunk|body|data)/i.test(key)) {
         return `<${Buffer.byteLength(value, "utf8")} bytes>`;
       }
-      return JSON.stringify(value);
+      return JSON.stringify(sanitizeTerminalText(value, { multiline: false, maxLength: 512 }));
     }
     if (Array.isArray(value)) return `<${value.length} items>`;
     if (value && typeof value === "object") return `<${Object.keys(value as Record<string, unknown>).length} fields>`;
@@ -222,7 +390,9 @@ export default function mcpExtension(pi: ExtensionAPI) {
   const formatMCPArgs = (args: Record<string, unknown>): string => {
     const entries = Object.entries(args ?? {});
     if (entries.length === 0) return "{}";
-    return entries.map(([key, value]) => `${key}=${compactValue(key, value)}`).join(" ");
+    return entries.map(([key, value]) =>
+      `${sanitizeTerminalText(key, { multiline: false, maxLength: 256 })}=${compactValue(key, value)}`,
+    ).join(" ");
   };
 
   const ensureRenderTicker = () => {
@@ -269,12 +439,12 @@ export default function mcpExtension(pi: ExtensionAPI) {
           ? theme.fg("error", "✗")
           : theme.fg("success", "✓");
     const timestamp = theme.fg("dim", `[${formatClock(state.calledAt)}]`);
-    const label = theme.fg("toolTitle", theme.bold(`mcp ${server.name}/${toolName}`));
+    const label = theme.fg("toolTitle", theme.bold(`mcp ${safeServerName(server)}/${safeToolName(toolName)}`));
     const elapsed = state.startedAt === undefined
       ? ""
       : theme.fg("dim", ` · ${formatElapsed((state.finishedAt ?? now) - state.startedAt)}`);
     const progress = context.isPartial && state.progressText
-      ? theme.fg("dim", ` · ${state.progressText}`)
+      ? theme.fg("dim", ` · ${sanitizeTerminalText(state.progressText, { multiline: false, maxLength: 1024 })}`)
       : "";
     const prefix = `${timestamp} ${icon} ${label}${elapsed}${progress}`;
     const formattedArgs = formatMCPArgs(args);
@@ -294,7 +464,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
   function initPaths(cwd: string) {
     const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), ".pi", "agent");
     userConfigPath = join(agentDir, "mcp-config.json");
-    projectConfigPath = join(cwd, ".pi", "mcp-config.json");
+    projectConfigPath = join(cwd, CONFIG_DIR_NAME, "mcp-config.json");
     credentialsPath = join(agentDir, ".credentials.json");
   }
 
@@ -308,8 +478,16 @@ export default function mcpExtension(pi: ExtensionAPI) {
     return { mcpOAuth: {}, mcpBearer: {} };
   }
 
+  function safeServerName(server: Pick<MCPServerConfig, "name">): string {
+    return sanitizeTerminalText(server.name, { multiline: false, maxLength: 256 });
+  }
+
+  function safeToolName(toolName: string): string {
+    return sanitizeTerminalText(toolName, { multiline: false, maxLength: 512 });
+  }
+
   function normalizeUrlForCredentialKey(url: string): string {
-    const parsed = new URL(url);
+    const parsed = parseMcpUrl(url);
     parsed.hash = "";
     parsed.hostname = parsed.hostname.toLowerCase();
     if ((parsed.protocol === "https:" && parsed.port === "443") ||
@@ -328,6 +506,11 @@ export default function mcpExtension(pi: ExtensionAPI) {
         mcpOAuth: parsed.mcpOAuth && typeof parsed.mcpOAuth === "object" ? parsed.mcpOAuth : {},
         mcpBearer: parsed.mcpBearer && typeof parsed.mcpBearer === "object" ? parsed.mcpBearer : {},
       };
+      for (const credential of Object.values(credentials.mcpOAuth)) {
+        if (!credential || typeof credential !== "object") continue;
+        parseMcpUrl(credential.serverUrl);
+        if (credential.discoveryState) validateOAuthDiscoveryState(credential.serverUrl, credential.discoveryState);
+      }
     } catch (error) {
       if (isFileMissing(error)) {
         credentials = emptyCredentials();
@@ -390,12 +573,39 @@ export default function mcpExtension(pi: ExtensionAPI) {
     return changed;
   }
 
+  function validateServerConfig(key: string, server: MCPServerConfig, path: string): MCPServerConfig {
+    if (!server || typeof server !== "object") throw new Error(`Invalid MCP server ${key} in ${path}`);
+    if (server.name !== key || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(key)) {
+      throw new Error(`Invalid MCP server name ${sanitizeTerminalText(key, { multiline: false })} in ${path}`);
+    }
+    if (server.transport !== "http") throw new Error(`Invalid MCP transport for ${key}: only http is supported`);
+    if (server.scope !== "user" && server.scope !== "project") throw new Error(`Invalid MCP scope for ${key}`);
+    if (typeof server.enabled !== "boolean") throw new Error(`Invalid enabled value for ${key}`);
+    if (server.authType !== undefined && !["none", "oauth", "bearer"].includes(server.authType)) {
+      throw new Error(`Invalid MCP auth type for ${key}`);
+    }
+    parseMcpUrl(server.url);
+    if (server.oauthConfig?.authUrl) parseSafeHttpUrl(server.oauthConfig.authUrl, `OAuth authUrl for ${key}`);
+    if (server.oauthConfig?.tokenUrl) parseSafeHttpUrl(server.oauthConfig.tokenUrl, `OAuth tokenUrl for ${key}`);
+    if (server.oauthConfig?.redirectUri && server.oauthConfig.redirectUri !== OAUTH_CALLBACK_URL) {
+      throw new Error(`Unsupported OAuth redirectUri for ${key}; this extension uses its fixed loopback callback`);
+    }
+    if (server.oauthConfig?.scope && !/^[\x21\x23-\x5B\x5D-\x7E](?:[\x20\x21\x23-\x5B\x5D-\x7E]{0,2047})$/.test(server.oauthConfig.scope)) {
+      throw new Error(`Invalid OAuth scope for ${key}`);
+    }
+    if (server.bearerTokenEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(server.bearerTokenEnv)) {
+      throw new Error(`Invalid bearerTokenEnv for ${key}`);
+    }
+    return server;
+  }
+
   async function readConfig(path: string): Promise<MCPConfig | undefined> {
     try {
       const parsed = JSON.parse(await readFile(path, "utf8")) as MCPConfig;
-      if (!parsed || typeof parsed !== "object" || !parsed.servers || typeof parsed.servers !== "object") {
+      if (!parsed || typeof parsed !== "object" || !parsed.servers || typeof parsed.servers !== "object" || Array.isArray(parsed.servers)) {
         throw new Error(`Invalid MCP configuration: ${path}`);
       }
+      for (const [key, server] of Object.entries(parsed.servers)) validateServerConfig(key, server, path);
       return parsed;
     } catch (error) {
       if (isFileMissing(error)) return undefined;
@@ -403,13 +613,15 @@ export default function mcpExtension(pi: ExtensionAPI) {
     }
   }
 
-  async function loadConfig() {
+  async function loadConfig(includeProjectConfig: boolean) {
+    projectConfigEnabled = includeProjectConfig;
     servers.clear();
     const userConfig = await readConfig(userConfigPath);
     for (const [name, server] of Object.entries(userConfig?.servers ?? {})) {
       if (server.scope === "user") servers.set(name, server);
     }
 
+    if (!includeProjectConfig) return;
     const projectConfig = await readConfig(projectConfigPath);
     for (const [name, server] of Object.entries(projectConfig?.servers ?? {})) {
       if (server.scope === "project") servers.set(name, server);
@@ -456,7 +668,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
     // Existing files must also be overwritten when their last server is removed.
     await Promise.all([
       writeConfig(userConfigPath, userServers),
-      writeConfig(projectConfigPath, projectServers),
+      projectConfigEnabled ? writeConfig(projectConfigPath, projectServers) : Promise.resolve(),
     ]);
   }
 
@@ -559,11 +771,12 @@ export default function mcpExtension(pi: ExtensionAPI) {
 
     async redirectToAuthorization(authorizationUrl: URL) {
       if (!this.interactive) throw new InteractiveAuthorizationRequiredError();
-      this.ctx.ui.notify(`Opening browser for ${this.server.name} authentication`, "info");
+        const safeAuthorizationUrl = parseSafeHttpUrl(authorizationUrl, "OAuth authorization endpoint");
+      this.ctx.ui.notify(`Opening browser for ${safeServerName(this.server)} authentication`, "info");
       try {
-        await openBrowser(authorizationUrl.toString());
+        await openBrowser(safeAuthorizationUrl);
       } catch {
-        this.ctx.ui.notify(`Open this URL manually:\n${authorizationUrl}`, "warning");
+        this.ctx.ui.notify(`Open this URL manually:\n${sanitizeTerminalText(safeAuthorizationUrl)}`, "warning");
       }
     }
 
@@ -579,10 +792,13 @@ export default function mcpExtension(pi: ExtensionAPI) {
     }
 
     discoveryState() {
-      return this.credential?.discoveryState;
+      const discoveryState = this.credential?.discoveryState;
+      if (discoveryState) validateOAuthDiscoveryState(this.server.url, discoveryState);
+      return discoveryState;
     }
 
     async saveDiscoveryState(discoveryState: OAuthDiscoveryState) {
+      validateOAuthDiscoveryState(this.server.url, discoveryState);
       this.ensureCredential().discoveryState = discoveryState;
       await saveCredentials();
     }
@@ -665,7 +881,8 @@ export default function mcpExtension(pi: ExtensionAPI) {
   }
 
   function getBearerToken(server: MCPServerConfig): string | undefined {
-    return credentials.mcpBearer[credentialKey(server)]?.token;
+    const envToken = server.bearerTokenEnv ? process.env[server.bearerTokenEnv] : undefined;
+    return envToken?.trim() || credentials.mcpBearer[credentialKey(server)]?.token;
   }
 
   function getOAuthCredential(server: MCPServerConfig): PersistedOAuthCredential | undefined {
@@ -681,8 +898,9 @@ export default function mcpExtension(pi: ExtensionAPI) {
     if (server.authType === "bearer" && bearerToken) {
       headers.Authorization = `Bearer ${bearerToken}`;
     }
-    const transport = new StreamableHTTPClientTransport(new URL(server.url), {
+    const transport = new StreamableHTTPClientTransport(parseMcpUrl(server.url), {
       authProvider,
+      fetch: safeFetch,
       requestInit: Object.keys(headers).length ? { headers } : undefined,
     });
     const client = new Client({ name: "pi-mcp-extension", version: "2.0.0" });
@@ -712,7 +930,10 @@ export default function mcpExtension(pi: ExtensionAPI) {
       return `${configured} offline_access`.split(/\s+/).filter((value, index, all) => all.indexOf(value) === index).join(" ");
     }
     try {
-      const discovered = await discoverOAuthServerInfo(server.url);
+      const discovered = await discoverOAuthServerInfo(server.url, { fetchFn: safeFetch });
+      const authorizationServer = parseSafeHttpUrl(discovered.authorizationServerUrl, "OAuth authorization server URL");
+      validateProtectedResourceMetadata(discovered.resourceMetadata, parseMcpUrl(server.url));
+      validateAuthorizationServerMetadata(discovered.authorizationServerMetadata, authorizationServer);
       const scopes = discovered.resourceMetadata?.scopes_supported ?? [];
       return [...new Set([...scopes, "offline_access"])].join(" ");
     } catch {
@@ -736,6 +957,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
           const refreshResult = await auth(nonInteractiveProvider, {
             serverUrl: server.url,
             scope: await getOAuthScope(server),
+            fetchFn: safeFetch,
           });
           if (refreshResult !== "AUTHORIZED") throw new InteractiveAuthorizationRequiredError();
         }
@@ -764,7 +986,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
 
     try {
       const scope = await getOAuthScope(server);
-      const result = await auth(provider, { serverUrl: server.url, scope });
+      const result = await auth(provider, { serverUrl: server.url, scope, fetchFn: safeFetch });
       if (result !== "REDIRECT") {
         await closeCallback();
         return await connectRaw(server, provider);
@@ -774,6 +996,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
         serverUrl: server.url,
         authorizationCode,
         scope,
+        fetchFn: safeFetch,
       });
       if (finishResult !== "AUTHORIZED") throw new UnauthorizedError("Failed to authorize");
       await closeCallback();
@@ -790,7 +1013,8 @@ export default function mcpExtension(pi: ExtensionAPI) {
   ): Promise<MCPConnection> {
     if (server.transport !== "http") throw new Error("Only Streamable HTTP transport is supported");
     if (server.authType === "bearer" && !getBearerToken(server)) {
-      throw new Error(`Bearer token missing. Run /mcp auth ${server.name}`);
+      const hint = server.bearerTokenEnv ? `Set ${server.bearerTokenEnv} and reconnect` : "Configure --bearer-token-env and reconnect";
+      throw new Error(`Bearer token missing. ${hint}`);
     }
     if (server.authType === "oauth") return connectWithOAuth(server, ctx, allowInteractive);
     return connectRaw(server);
@@ -798,35 +1022,45 @@ export default function mcpExtension(pi: ExtensionAPI) {
 
   async function listAllTools(client: Client): Promise<MCPTool[]> {
     const tools: MCPTool[] = [];
+    const cursors = new Set<string>();
     let cursor: string | undefined;
-    do {
+    for (let pages = 0; ; pages++) {
+      if (pages >= MAX_DISCOVERY_PAGES) throw new Error(`MCP tool discovery exceeded ${MAX_DISCOVERY_PAGES} pages`);
       const page = await client.listTools(
         cursor ? { cursor } : undefined,
         { timeout: MCP_REQUEST_TIMEOUT_MS },
       );
       tools.push(...(page.tools as MCPTool[]));
+      if (tools.length > MAX_DISCOVERY_ITEMS) throw new Error(`MCP tool discovery exceeded ${MAX_DISCOVERY_ITEMS} items`);
       cursor = page.nextCursor;
-    } while (cursor);
-    return tools;
+      if (!cursor) return tools;
+      if (cursors.has(cursor)) throw new Error("MCP tool discovery returned a repeated pagination cursor");
+      cursors.add(cursor);
+    }
   }
 
   async function listAllResources(client: Client): Promise<MCPResource[]> {
     if (!client.getServerCapabilities()?.resources) return [];
     const resources: MCPResource[] = [];
+    const cursors = new Set<string>();
     let cursor: string | undefined;
-    do {
+    for (let pages = 0; ; pages++) {
+      if (pages >= MAX_DISCOVERY_PAGES) throw new Error(`MCP resource discovery exceeded ${MAX_DISCOVERY_PAGES} pages`);
       const page = await client.listResources(
         cursor ? { cursor } : undefined,
         { timeout: MCP_REQUEST_TIMEOUT_MS },
       );
       resources.push(...page.resources);
+      if (resources.length > MAX_DISCOVERY_ITEMS) throw new Error(`MCP resource discovery exceeded ${MAX_DISCOVERY_ITEMS} items`);
       cursor = page.nextCursor;
-    } while (cursor);
-    return resources;
+      if (!cursor) return resources;
+      if (cursors.has(cursor)) throw new Error("MCP resource discovery returned a repeated pagination cursor");
+      cursors.add(cursor);
+    }
   }
 
   function schemaToTypeBox(schema: any, required = true): any {
-    const options = schema?.description ? { description: schema.description } : {};
+    const options = schema?.description ? { description: sanitizeTerminalText(schema.description) } : {};
     let converted: any;
     if (Array.isArray(schema?.enum) && schema.enum.length > 0) {
       converted = Type.Union(schema.enum.map((value: any) => Type.Literal(value)), options);
@@ -879,71 +1113,98 @@ export default function mcpExtension(pi: ExtensionAPI) {
     return connection;
   }
 
+  function truncateRemoteOutput(value: string): string {
+    const truncated = truncateHead(sanitizeTerminalText(value, { maxLength: DEFAULT_MAX_BYTES * 4 }), { maxBytes: DEFAULT_MAX_BYTES, maxLines: DEFAULT_MAX_LINES });
+    return truncated.truncated
+      ? `${truncated.content}\n\n[MCP output truncated: ${truncated.outputBytes} of ${truncated.totalBytes} bytes.]`
+      : truncated.content;
+  }
+
   function formatToolResult(result: any): string {
     const lines: string[] = [];
     for (const item of result.content ?? []) {
       if (item.type === "text") lines.push(item.text);
-      else if (item.type === "image") lines.push(`[Image: ${item.mimeType}]`);
-      else if (item.type === "audio") lines.push(`[Audio: ${item.mimeType}]`);
+      else if (item.type === "image") lines.push(`[Image: ${sanitizeTerminalText(item.mimeType, { multiline: false })}]`);
+      else if (item.type === "audio") lines.push(`[Audio: ${sanitizeTerminalText(item.mimeType, { multiline: false })}]`);
       else if (item.type === "resource") {
-        lines.push(item.resource?.text ?? `[Resource: ${item.resource?.uri ?? "unknown"}]`);
+        lines.push(item.resource?.text ?? `[Resource: ${sanitizeTerminalText(item.resource?.uri ?? "unknown", { multiline: false })}]`);
       } else if (item.type === "resource_link") {
-        lines.push(`[Resource: ${item.uri}]`);
+        lines.push(`[Resource: ${sanitizeTerminalText(item.uri, { multiline: false })}]`);
       }
     }
     if (result.structuredContent) lines.push(JSON.stringify(result.structuredContent, null, 2));
-    return lines.join("\n") || "MCP tool returned no content";
+    return truncateRemoteOutput(lines.join("\n") || "MCP tool returned no content");
   }
 
   function registerServerTools(server: MCPServerConfig) {
     if (!server.enabled) return;
     deactivateServerTools(server.name);
     const names = new Set<string>();
+    const usedNames = new Set(pi.getAllTools().map(tool => tool.name));
+    for (const name of registeredToolNames.get(server.name) ?? []) usedNames.delete(name);
+    const allocateName = (remoteName: string, kind: "tool" | "resource") => {
+      const base = normalizedMcpToolName(server.name, remoteName);
+      const registeredName = disambiguateToolName(base, `${server.name}\0${kind}\0${remoteName}`, usedNames);
+      usedNames.add(registeredName);
+      names.add(registeredName);
+      return registeredName;
+    };
 
     for (const tool of server.tools ?? []) {
-      const registeredName = `mcp_${server.name}_${tool.name}`.replace(/[^a-zA-Z0-9_]/g, "_");
-      names.add(registeredName);
+      const registeredName = allocateName(tool.name, "tool");
+      const displayServerName = safeServerName(server);
+      const displayToolName = safeToolName(tool.name);
       pi.registerTool({
         name: registeredName,
-        label: `${server.name}: ${tool.name}`,
-        description: tool.description || `MCP tool ${tool.name}`,
+        label: `${displayServerName}: ${displayToolName}`,
+        description: sanitizeTerminalText(tool.description || `MCP tool ${displayToolName}`),
         parameters: schemaToTypeBox(tool.inputSchema),
         renderShell: "self",
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
           if (!server.enabled) throw new Error(`MCP server ${server.name} is disabled`);
           onUpdate?.({
-            content: [{ type: "text", text: `Calling ${tool.name}...` }],
-            details: { server: server.name, tool: tool.name },
+            content: [{ type: "text", text: `Calling ${displayToolName}...` }],
+            details: { server: displayServerName, tool: displayToolName },
           });
-          const connection = await getConnection(server.name, ctx);
-          const result = await connection.client.callTool(
-            { name: tool.name, arguments: params as Record<string, unknown> },
-            undefined,
-            {
-              signal,
-              resetTimeoutOnProgress: true,
-              onprogress: progress => {
-                const percent = progress.total && progress.total > 0
-                  ? ` ${Math.round(progress.progress / progress.total * 100)}%`
-                  : "";
-                onUpdate?.({
-                  content: [{
-                    type: "text",
-                    text: `${progress.message ?? `Calling ${tool.name}`}...${percent}`,
-                  }],
-                  details: { server: server.name, tool: tool.name, progress },
-                });
+          try {
+            const connection = await getConnection(server.name, ctx);
+            const result = await connection.client.callTool(
+              { name: tool.name, arguments: params as Record<string, unknown> },
+              undefined,
+              {
+                signal,
+                resetTimeoutOnProgress: true,
+                onprogress: progress => {
+                  const percent = progress.total && progress.total > 0
+                    ? ` ${Math.round(progress.progress / progress.total * 100)}%`
+                    : "";
+                  const progressMessage = sanitizeTerminalText(progress.message ?? `Calling ${displayToolName}`, {
+                    multiline: false,
+                    maxLength: 1024,
+                  });
+                  const safeProgress = {
+                    progress: Number.isFinite(progress.progress) ? progress.progress : 0,
+                    total: Number.isFinite(progress.total) ? progress.total : undefined,
+                    message: progressMessage,
+                  };
+                  onUpdate?.({
+                    content: [{ type: "text", text: `${progressMessage}...${percent}` }],
+                    details: { server: displayServerName, tool: displayToolName, progress: safeProgress },
+                  });
+                },
               },
-            },
-          );
-          if ("isError" in result && result.isError) throw new Error(formatToolResult(result));
-          return {
-            content: [{ type: "text", text: formatToolResult(result) }],
-            details: { server: server.name, tool: tool.name, scope: server.scope },
-          };
+            );
+            if ("isError" in result && result.isError) throw new Error(formatToolResult(result));
+            return {
+              content: [{ type: "text", text: formatToolResult(result) }],
+              details: { server: displayServerName, tool: displayToolName, scope: server.scope },
+            };
+          } catch (error) {
+            throw new Error(getErrorMessage(error));
+          }
         },
         renderCall(args, theme, context) {
-          return renderCompactMCPCall(server, tool.name, args as Record<string, unknown>, theme, context as unknown as CompactMCPRenderContext);
+          return renderCompactMCPCall(server, displayToolName, args as Record<string, unknown>, theme, context as unknown as CompactMCPRenderContext);
         },
         renderResult(result, options, theme, context) {
           const progress = (result.details as any)?.progress;
@@ -951,42 +1212,54 @@ export default function mcpExtension(pi: ExtensionAPI) {
             const percent = progress.total && progress.total > 0
               ? `${Math.round(progress.progress / progress.total * 100)}%`
               : `${progress.progress}`;
-            context.state.progressText = progress.message ? `${percent} ${progress.message}` : percent;
+            const progressMessage = progress.message
+              ? sanitizeTerminalText(progress.message, { multiline: false, maxLength: 1024 })
+              : "";
+            context.state.progressText = progressMessage ? `${percent} ${progressMessage}` : percent;
           }
-          renderCompactMCPCall(server, tool.name, context.args as Record<string, unknown>, theme, context as unknown as CompactMCPRenderContext);
+          renderCompactMCPCall(server, displayToolName, context.args as Record<string, unknown>, theme, context as unknown as CompactMCPRenderContext);
           return new Text("", 0, 0);
         },
       });
     }
 
     if ((server.resources?.length ?? 0) > 0) {
-      const registeredName = `mcp_${server.name}_read_resource`.replace(/[^a-zA-Z0-9_]/g, "_");
-      names.add(registeredName);
+      const registeredName = allocateName("read_resource", "resource");
+      const displayServerName = safeServerName(server);
+      const resourceUris = server.resources!.map(resource => sanitizeTerminalText(resource.uri, {
+        multiline: false,
+        maxLength: 1024,
+      }));
       pi.registerTool({
         name: registeredName,
-        label: `${server.name}: Read Resource`,
-        description: `Read an MCP resource from ${server.name}`,
+        label: `${displayServerName}: Read Resource`,
+        description: `Read an MCP resource from ${displayServerName}`,
         parameters: Type.Object({
           uri: Type.String({
-            description: `Resource URI. Available: ${server.resources!.map(resource => resource.uri).join(", ")}`,
+            description: sanitizeTerminalText(`Resource URI. Available: ${resourceUris.join(", ")}`),
           }),
         }),
         renderShell: "self",
         async execute(_toolCallId, params, signal, onUpdate, ctx) {
           if (!server.enabled) throw new Error(`MCP server ${server.name} is disabled`);
+          const displayUri = sanitizeTerminalText(params.uri, { multiline: false, maxLength: 2048 });
           onUpdate?.({
-            content: [{ type: "text", text: `Reading ${params.uri}...` }],
-            details: { server: server.name, uri: params.uri },
+            content: [{ type: "text", text: `Reading ${displayUri}...` }],
+            details: { server: displayServerName, uri: displayUri },
           });
-          const connection = await getConnection(server.name, ctx);
-          const result = await connection.client.readResource({ uri: params.uri }, { signal });
-          const content = result.contents.map(item =>
-            "text" in item ? item.text : `[Binary resource: ${item.mimeType ?? "unknown"}]`,
-          );
-          return {
-            content: [{ type: "text", text: content.join("\n") }],
-            details: { server: server.name, uri: params.uri, scope: server.scope },
-          };
+          try {
+            const connection = await getConnection(server.name, ctx);
+            const result = await connection.client.readResource({ uri: params.uri }, { signal });
+            const content = result.contents.map(item =>
+              "text" in item ? item.text : `[Binary resource: ${sanitizeTerminalText(item.mimeType ?? "unknown", { multiline: false })}]`,
+            );
+            return {
+              content: [{ type: "text", text: truncateRemoteOutput(content.join("\n")) }],
+              details: { server: displayServerName, uri: displayUri, scope: server.scope },
+            };
+          } catch (error) {
+            throw new Error(getErrorMessage(error));
+          }
         },
         renderCall(args, theme, context) {
           return renderCompactMCPCall(server, "read_resource", args as Record<string, unknown>, theme, context as unknown as CompactMCPRenderContext);
@@ -1004,20 +1277,20 @@ export default function mcpExtension(pi: ExtensionAPI) {
 
   async function connectToServer(server: MCPServerConfig, ctx: any, allowAuthPrompt = true) {
     await closeConnection(server.name);
-    ctx.ui.notify(`Connecting to ${server.name} (${server.scope})...`, "info");
+    ctx.ui.notify(`Connecting to ${safeServerName(server)} (${server.scope})...`, "info");
 
     try {
       let connection: MCPConnection;
       const hasOAuthToken = Boolean(getOAuthCredential(server)?.tokens);
       if (server.authType === "oauth" && !hasOAuthToken) {
         if (!allowAuthPrompt || !ctx.hasUI) {
-          throw new Error(`Authentication required. Run /mcp auth ${server.name}`);
+          throw new Error(`Authentication required. Run /mcp auth ${safeServerName(server)}`);
         }
         const authenticate = await ctx.ui.confirm(
           "MCP authentication required",
-          `Open the browser to authenticate ${server.name}?`,
+          `Open the browser to authenticate ${safeServerName(server)}?`,
         );
-        if (!authenticate) throw new Error(`Authentication required. Run /mcp auth ${server.name}`);
+        if (!authenticate) throw new Error(`Authentication required. Run /mcp auth ${safeServerName(server)}`);
       }
 
       try {
@@ -1026,13 +1299,13 @@ export default function mcpExtension(pi: ExtensionAPI) {
         if (!(error instanceof InteractiveAuthorizationRequiredError) &&
             (!isUnauthorized(error) || server.authType === "bearer")) throw error;
         if (!allowAuthPrompt || !ctx.hasUI) {
-          throw new Error(`Authentication required. Run /mcp auth ${server.name}`);
+          throw new Error(`Authentication required. Run /mcp auth ${safeServerName(server)}`);
         }
         const authenticate = await ctx.ui.confirm(
           "MCP authentication required",
-          `Open the browser to authenticate ${server.name}?`,
+          `Open the browser to authenticate ${safeServerName(server)}?`,
         );
-        if (!authenticate) throw new Error(`Authentication required. Run /mcp auth ${server.name}`);
+        if (!authenticate) throw new Error(`Authentication required. Run /mcp auth ${safeServerName(server)}`);
         server.authType = "oauth";
         server.oauthConfig ??= {};
         await saveConfig();
@@ -1074,12 +1347,12 @@ export default function mcpExtension(pi: ExtensionAPI) {
     void attempt.then(result => {
       if (!shuttingDown) {
         ctx.ui.notify(
-          `${server.name}: ${result.tools} tools, ${result.resources} resources (${Date.now() - startedAt} ms)`,
+          `${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources (${Date.now() - startedAt} ms)`,
           "info",
         );
       }
     }).catch(error => {
-      if (!shuttingDown) ctx.ui.notify(`${server.name}: ${getErrorMessage(error)}`, "error");
+      if (!shuttingDown) ctx.ui.notify(`${safeServerName(server)}: ${getErrorMessage(error)}`, "error");
     }).finally(() => {
       if (connectionAttempts.get(server.name) === attempt) connectionAttempts.delete(server.name);
     });
@@ -1089,7 +1362,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
   pi.on("session_start", async (_event, ctx) => {
     shuttingDown = false;
     initPaths(ctx.cwd);
-    await Promise.all([loadConfig(), loadCredentials()]);
+    await Promise.all([loadConfig(ctx.isProjectTrusted()), loadCredentials()]);
     if (await migrateLegacyCredentials()) {
       await Promise.all([saveConfig(), saveCredentials()]);
     }
@@ -1130,6 +1403,10 @@ export default function mcpExtension(pi: ExtensionAPI) {
     description: "Manage MCP servers",
     handler: async (args, ctx) => {
       const parts = args.trim().split(/\s+/).filter(Boolean);
+      if (parts.includes("--token")) {
+        ctx.ui.notify("Do not place bearer tokens in command text. Use --bearer-token-env <ENV_VAR>.", "error");
+        return;
+      }
       const command = parts[0] || "list";
       if (command === "add") await handleAdd(parts, ctx);
       else if (command === "remove") await handleRemove(parts, ctx);
@@ -1146,7 +1423,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
     ctx.ui.notify(
       "MCP commands:\n" +
       "  /mcp list [--details]\n" +
-      "  /mcp add --transport http --scope <user|project> <name> <url>\n" +
+      "  /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>] [--bearer-token-env <ENV_VAR>]\n" +
       "  /mcp remove <name>\n" +
       "  /mcp enable|disable <name>\n" +
       "  /mcp connect <name>\n" +
@@ -1169,8 +1446,8 @@ export default function mcpExtension(pi: ExtensionAPI) {
       for (const server of scoped) {
         const state = server.enabled ? "enabled" : "disabled";
         const connected = connections.has(server.name) ? "connected" : "disconnected";
-        lines.push(`  ${server.name}: ${server.url} [${state}, ${connected}, ${server.authType ?? "none"}]`);
-        lines.push(`    ${(server.tools?.length ?? 0)} tools, ${(server.resources?.length ?? 0)} resources${server.error ? `; ${server.error}` : ""}`);
+        lines.push(`  ${safeServerName(server)}: ${sanitizeTerminalText(server.url, { multiline: false })} [${state}, ${connected}, ${server.authType ?? "none"}]`);
+        lines.push(`    ${(server.tools?.length ?? 0)} tools, ${(server.resources?.length ?? 0)} resources${server.error ? `; ${sanitizeTerminalText(server.error)}` : ""}`);
       }
     }
     ctx.ui.notify(lines.join("\n"), "info");
@@ -1180,36 +1457,61 @@ export default function mcpExtension(pi: ExtensionAPI) {
     let transport: "http" | "stdio" | undefined;
     let scope: "user" | "project" | undefined;
     let authType: "none" | "oauth" | "bearer" = "none";
-    let token: string | undefined;
     let oauthScope: string | undefined;
+    let bearerTokenEnv: string | undefined;
     const positional: string[] = [];
+    let parseError: string | undefined;
 
     for (let index = 1; index < parts.length; index++) {
       const part = parts[index];
-      if (part === "--transport") transport = parts[++index] as "http" | "stdio";
-      else if (part === "--scope") scope = parts[++index] as "user" | "project";
-      else if (part === "--auth") authType = parts[++index] as "none" | "oauth" | "bearer";
-      else if (part === "--token") token = parts[++index];
-      else if (part === "--oauth-scope") oauthScope = parts[++index];
-      else positional.push(part);
+      if (["--transport", "--scope", "--auth", "--oauth-scope", "--bearer-token-env"].includes(part)) {
+        const value = parts[++index];
+        if (!value) {
+          parseError = `Missing value for ${part}`;
+          break;
+        }
+        if (part === "--transport") transport = value as "http" | "stdio";
+        else if (part === "--scope") scope = value as "user" | "project";
+        else if (part === "--auth") authType = value as "none" | "oauth" | "bearer";
+        else if (part === "--oauth-scope") oauthScope = value;
+        else bearerTokenEnv = value;
+      } else if (part.startsWith("--")) {
+        parseError = `Unknown option: ${part}`;
+        break;
+      } else positional.push(part);
     }
 
-    const [name, url] = positional;
-    if (transport !== "http" || !["user", "project"].includes(scope ?? "") || !name || !url) {
+    const [name, url, ...extra] = positional;
+    const validAuthType = ["none", "oauth", "bearer"].includes(authType);
+    const validEnv = !bearerTokenEnv || /^[A-Za-z_][A-Za-z0-9_]*$/.test(bearerTokenEnv);
+    const validOAuthScope = !oauthScope || /^[\x21\x23-\x5B\x5D-\x7E]{1,2048}$/.test(oauthScope);
+    if (parseError || transport !== "http" || !["user", "project"].includes(scope ?? "") || !validAuthType ||
+        !validEnv || !validOAuthScope || !name || !url || extra.length > 0 || (bearerTokenEnv && authType !== "bearer") ||
+        (authType === "bearer" && !bearerTokenEnv) || (oauthScope && authType !== "oauth")) {
       ctx.ui.notify(
-        "Usage: /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>]",
+        `${parseError ? `${parseError}\n` : ""}Usage: /mcp add --transport http --scope <user|project> <name> <url> ` +
+        "[--auth <none|oauth|bearer>] [--oauth-scope <scope>] [--bearer-token-env <ENV_VAR>]",
         "error",
       );
       return;
     }
     try {
-      new URL(url);
-    } catch {
-      ctx.ui.notify(`Invalid MCP URL: ${url}`, "error");
+      parseMcpUrl(url);
+    } catch (error) {
+      ctx.ui.notify(`Invalid MCP URL: ${getErrorMessage(error)}`, "error");
+      return;
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) {
+      ctx.ui.notify("MCP server names must be 1-128 characters using letters, numbers, dot, underscore, or hyphen", "error");
       return;
     }
     if (servers.has(name)) {
-      ctx.ui.notify(`MCP server \"${name}\" already exists`, "error");
+      ctx.ui.notify(`MCP server \"${sanitizeTerminalText(name, { multiline: false })}\" already exists`, "error");
+      return;
+    }
+
+    if (scope === "project" && !ctx.isProjectTrusted()) {
+      ctx.ui.notify("Project-scoped MCP servers require a trusted project", "error");
       return;
     }
 
@@ -1220,22 +1522,16 @@ export default function mcpExtension(pi: ExtensionAPI) {
       scope: scope!,
       enabled: true,
       authType,
+      bearerTokenEnv,
       oauthConfig: authType === "oauth" ? { scope: oauthScope } : undefined,
     };
     servers.set(name, server);
-    if (authType === "bearer" && token) {
-      credentials.mcpBearer[credentialKey(server)] = {
-        serverName: server.name,
-        serverUrl: server.url,
-        token,
-      };
-    }
     await Promise.all([saveConfig(), saveCredentials()]);
     try {
       const result = await connectToServer(server, ctx);
-      ctx.ui.notify(`Added ${name}: ${result.tools} tools, ${result.resources} resources`, "info");
+      ctx.ui.notify(`Added ${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources`, "info");
     } catch (error) {
-      ctx.ui.notify(`Added ${name}, but connection failed: ${getErrorMessage(error)}`, "warning");
+      ctx.ui.notify(`Added ${safeServerName(server)}, but connection failed: ${getErrorMessage(error)}`, "warning");
     }
   }
 
@@ -1266,9 +1562,9 @@ export default function mcpExtension(pi: ExtensionAPI) {
     await saveConfig();
     try {
       const result = await connectToServer(server, ctx);
-      ctx.ui.notify(`Enabled ${server.name}: ${result.tools} tools, ${result.resources} resources`, "info");
+      ctx.ui.notify(`Enabled ${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources`, "info");
     } catch (error) {
-      ctx.ui.notify(`Enabled ${server.name}, but connection failed: ${getErrorMessage(error)}`, "warning");
+      ctx.ui.notify(`Enabled ${safeServerName(server)}, but connection failed: ${getErrorMessage(error)}`, "warning");
     }
   }
 
@@ -1282,7 +1578,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
     deactivateServerTools(server.name);
     await closeConnection(server.name);
     await saveConfig();
-    ctx.ui.notify(`Disabled ${server.name}`, "info");
+    ctx.ui.notify(`Disabled ${safeServerName(server)}`, "info");
   }
 
   async function handleConnect(parts: string[], ctx: any) {
@@ -1293,7 +1589,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
     }
     try {
       const result = await connectToServer(server, ctx);
-      ctx.ui.notify(`Connected ${server.name}: ${result.tools} tools, ${result.resources} resources`, "info");
+      ctx.ui.notify(`Connected ${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources`, "info");
     } catch (error) {
       ctx.ui.notify(`Connection failed: ${getErrorMessage(error)}`, "error");
     }
@@ -1311,14 +1607,13 @@ export default function mcpExtension(pi: ExtensionAPI) {
     }
 
     if (server.authType === "bearer") {
-      const token = await ctx.ui.input("Enter bearer token", "Paste token here");
-      if (!token) return;
-      credentials.mcpBearer[credentialKey(server)] = {
-        serverName: server.name,
-        serverUrl: server.url,
-        token,
-      };
-      delete server.token;
+      ctx.ui.notify(
+        server.bearerTokenEnv
+          ? `Bearer credentials are read from ${server.bearerTokenEnv}. Set it in Pi's environment, then run /mcp connect ${safeServerName(server)}.`
+          : "Pi 0.82.1 exposes no supported masked secret input to ordinary extensions. Re-add this server with --bearer-token-env <ENV_VAR>; ordinary ui.input is intentionally not used.",
+        "warning",
+      );
+      return;
     } else {
       server.authType = "oauth";
       server.oauthConfig ??= {};
@@ -1332,7 +1627,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
 
     try {
       const result = await connectToServer(server, ctx);
-      ctx.ui.notify(`Authenticated ${server.name}: ${result.tools} tools, ${result.resources} resources`, "info");
+      ctx.ui.notify(`Authenticated ${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources`, "info");
     } catch (error) {
       ctx.ui.notify(`Authentication failed: ${getErrorMessage(error)}`, "error");
     }
@@ -1344,6 +1639,12 @@ export default function mcpExtension(pi: ExtensionAPI) {
       const url = args.trim();
       if (!url) {
         ctx.ui.notify("Usage: /mcp-test <url>", "error");
+        return;
+      }
+      try {
+        parseMcpUrl(url);
+      } catch (error) {
+        ctx.ui.notify(`Invalid MCP URL: ${getErrorMessage(error)}`, "error");
         return;
       }
       const testServer: MCPServerConfig = {

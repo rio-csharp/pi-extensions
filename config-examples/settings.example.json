@@ -1,6 +1,5 @@
 {
   "theme": "dark",
-  "shellPath": "bash",
   "defaultProvider": "your-provider-id",
   "defaultModel": "your-model-id",
   "defaultThinkingLevel": "high"

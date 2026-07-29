@@ -23,16 +23,28 @@ export interface AgentDiscoveryResult {
 	projectAgentsDir: string | null;
 }
 
-function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
-	const agents: AgentConfig[] = [];
+function isPathWithin(root: string, candidate: string): boolean {
+	const relative = path.relative(root, candidate);
+	return relative === "" || (!relative.startsWith(`..${path.sep}`) && relative !== ".." && !path.isAbsolute(relative));
+}
 
-	if (!fs.existsSync(dir)) {
-		return agents;
+function canonicalExistingPath(candidate: string): string | null {
+	try {
+		return fs.realpathSync.native(candidate);
+	} catch {
+		return null;
 	}
+}
+
+function loadAgentsFromDir(dir: string, source: "user" | "project", boundary: string): AgentConfig[] {
+	const agents: AgentConfig[] = [];
+	const canonicalDir = canonicalExistingPath(dir);
+	const canonicalBoundary = canonicalExistingPath(boundary);
+	if (!canonicalDir || !canonicalBoundary || !isPathWithin(canonicalBoundary, canonicalDir)) return agents;
 
 	let entries: fs.Dirent[];
 	try {
-		entries = fs.readdirSync(dir, { withFileTypes: true });
+		entries = fs.readdirSync(canonicalDir, { withFileTypes: true });
 	} catch {
 		return agents;
 	}
@@ -41,65 +53,90 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 		if (!entry.name.endsWith(".md")) continue;
 		if (!entry.isFile() && !entry.isSymbolicLink()) continue;
 
-		const filePath = path.join(dir, entry.name);
+		const filePath = path.join(canonicalDir, entry.name);
+		const canonicalFile = canonicalExistingPath(filePath);
+		if (!canonicalFile || !isPathWithin(canonicalDir, canonicalFile)) continue;
 		let content: string;
 		try {
-			content = fs.readFileSync(filePath, "utf-8");
+			if (!fs.statSync(canonicalFile).isFile()) continue;
+			content = fs.readFileSync(canonicalFile, "utf-8");
 		} catch {
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		let parsed: { frontmatter: Record<string, unknown>; body: string };
+		try {
+			parsed = parseFrontmatter<Record<string, unknown>>(content);
+		} catch {
+			// A malformed agent file must not prevent discovery of its siblings.
+			continue;
+		}
+		const { frontmatter, body } = parsed;
+		if (
+			typeof frontmatter.name !== "string"
+			|| !frontmatter.name.trim()
+			|| typeof frontmatter.description !== "string"
+			|| !frontmatter.description.trim()
+			|| (frontmatter.model !== undefined && typeof frontmatter.model !== "string")
+		) continue;
 
-		if (!frontmatter.name || !frontmatter.description) {
+		let tools: string[] | undefined;
+		if (typeof frontmatter.tools === "string") {
+			tools = frontmatter.tools.split(",").map((tool) => tool.trim()).filter(Boolean);
+		} else if (Array.isArray(frontmatter.tools) && frontmatter.tools.every((tool) => typeof tool === "string")) {
+			tools = frontmatter.tools.map((tool) => tool.trim()).filter(Boolean);
+		} else if (frontmatter.tools !== undefined) {
+			// Reject malformed values per-file instead of throwing on `.split()`.
 			continue;
 		}
 
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
-
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
+			name: frontmatter.name.trim(),
+			description: frontmatter.description.trim(),
 			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			model: frontmatter.model || undefined,
 			systemPrompt: body,
 			source,
-			filePath,
+			filePath: canonicalFile,
 		});
 	}
 
 	return agents;
 }
 
-function isDirectory(p: string): boolean {
-	try {
-		return fs.statSync(p).isDirectory();
-	} catch {
-		return false;
+function findProjectAgentsDir(cwd: string, projectBoundary: string | undefined): string | null {
+	const canonicalCwd = canonicalExistingPath(cwd);
+	if (!canonicalCwd) return null;
+	const requestedBoundary = projectBoundary ? canonicalExistingPath(projectBoundary) : null;
+	const canonicalBoundary = requestedBoundary && isPathWithin(requestedBoundary, canonicalCwd)
+		? requestedBoundary
+		: canonicalCwd;
+
+	let current = canonicalCwd;
+	while (isPathWithin(canonicalBoundary, current)) {
+		const candidate = path.join(current, CONFIG_DIR_NAME, "agents");
+		const canonicalCandidate = canonicalExistingPath(candidate);
+		if (canonicalCandidate && isPathWithin(current, canonicalCandidate)) {
+			try {
+				if (fs.statSync(canonicalCandidate).isDirectory()) return canonicalCandidate;
+			} catch {
+				// Keep searching toward the trusted boundary.
+			}
+		}
+		if (current === canonicalBoundary) break;
+		const parent = path.dirname(current);
+		if (parent === current || !isPathWithin(canonicalBoundary, parent)) break;
+		current = parent;
 	}
+	return null;
 }
 
-function findNearestProjectAgentsDir(cwd: string): string | null {
-	let currentDir = cwd;
-	while (true) {
-		const candidate = path.join(currentDir, CONFIG_DIR_NAME, "agents");
-		if (isDirectory(candidate)) return candidate;
-
-		const parentDir = path.dirname(currentDir);
-		if (parentDir === currentDir) return null;
-		currentDir = parentDir;
-	}
-}
-
-export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryResult {
+export function discoverAgents(cwd: string, scope: AgentScope, projectBoundary?: string): AgentDiscoveryResult {
 	const userDir = path.join(getAgentDir(), "agents");
-	const projectAgentsDir = findNearestProjectAgentsDir(cwd);
+	const projectAgentsDir = findProjectAgentsDir(cwd, projectBoundary);
 
-	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user");
-	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project");
+	const userAgents = scope === "project" ? [] : loadAgentsFromDir(userDir, "user", userDir);
+	const projectAgents = scope === "user" || !projectAgentsDir ? [] : loadAgentsFromDir(projectAgentsDir, "project", projectAgentsDir);
 
 	const agentMap = new Map<string, AgentConfig>();
 

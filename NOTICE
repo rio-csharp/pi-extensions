@@ -1,6 +1,14 @@
+Pi Extensions — upstream derivation notice
+
+Substantial portions of this repository are derived from and adapted from the
+official Pi extension examples, particularly the compact built-in tool rendering
+patterns and the subagent example. The upstream project is hosted by Earendil
+Works at https://github.com/earendil-works/pi.
+
+The upstream Pi code and examples are provided under the following MIT license:
+
 MIT License
 
-Copyright (c) 2026 rio-csharp
 Copyright (c) 2025 Mario Zechner
 
 Permission is hereby granted, free of charge, to any person obtaining a copy

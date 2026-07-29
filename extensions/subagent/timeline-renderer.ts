@@ -1,6 +1,7 @@
-import type { Theme, ToolRenderContext } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
+import { terminalSanitize } from "./security.ts";
 import type {
 	BackgroundJobStatus,
 	SingleResult,
@@ -10,6 +11,21 @@ import type {
 	SubagentTimelineState,
 	UsageStats,
 } from "./types.ts";
+
+interface ToolRenderContext<TState, TArgs> {
+	args: TArgs;
+	toolCallId: string;
+	invalidate: () => void;
+	lastComponent: Component | undefined;
+	state: TState;
+	cwd: string;
+	executionStarted: boolean;
+	argsComplete: boolean;
+	isPartial: boolean;
+	expanded: boolean;
+	showImages: boolean;
+	isError: boolean;
+}
 
 interface TimelineRenderContext {
 	args: SubagentArgs;
@@ -58,9 +74,10 @@ function formatElapsed(milliseconds: number): string {
 
 function shortJobId(jobId: string | undefined): string {
 	if (!jobId) return "unknown";
-	const prefix = jobId.startsWith("sub-") ? "sub-" : "";
-	const body = prefix ? jobId.slice(prefix.length) : jobId;
-	return body.length > 8 ? `${prefix}${body.slice(0, 8)}` : jobId;
+	const safeJobId = terminalSanitize(jobId);
+	const prefix = safeJobId.startsWith("sub-") ? "sub-" : "";
+	const body = prefix ? safeJobId.slice(prefix.length) : safeJobId;
+	return body.length > 8 ? `${prefix}${body.slice(0, 8)}` : safeJobId;
 }
 
 function formatTokens(count: number): string {
@@ -71,7 +88,7 @@ function formatTokens(count: number): string {
 }
 
 function compactTitle(value: string | undefined, fallback: string): string {
-	const text = value?.replace(/[\r\n\t]/g, " ").replace(/ +/g, " ").trim() || fallback;
+	const text = terminalSanitize(value ?? "").trim() || terminalSanitize(fallback);
 	return text.length > 60 ? `${text.slice(0, 57)}...` : text;
 }
 
@@ -82,7 +99,7 @@ function summarizeTitles(items: Array<{ title: string }> | undefined): string {
 }
 
 function describeStart(args: SubagentArgs): string {
-	const scope = args.agentScope ?? "user";
+	const scope = terminalSanitize(String(args.agentScope ?? "user"));
 	if (args.chain?.length) {
 		const titles = summarizeTitles(args.chain);
 		return `chain · ${args.chain.length} steps${titles ? ` · ${titles}` : ""} · ${scope}`;
@@ -92,7 +109,7 @@ function describeStart(args: SubagentArgs): string {
 		return `parallel · ${args.tasks.length} tasks${titles ? ` · ${titles}` : ""} · ${scope}`;
 	}
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${args.agent ?? "unknown agent"} · ${scope}`;
+	return `${title} · ${terminalSanitize(args.agent ?? "unknown agent")} · ${scope}`;
 }
 
 function isFailedResult(result: SingleResult): boolean {
@@ -138,7 +155,7 @@ function getTextResult(result: any): string {
 
 function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined): string {
 	if (details?.background && details.jobId) {
-		return `background · ${details.jobStatus ?? "running"} · ${details.jobId}`;
+		return `background · ${terminalSanitize(String(details.jobStatus ?? "running"))} · ${terminalSanitize(details.jobId)}`;
 	}
 	if (!details?.results.length) return describeStart(args);
 	const failed = details.results.filter(isFailedResult).length;
@@ -153,7 +170,7 @@ function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined
 
 	const result = details.results[0];
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${result?.agent ?? args.agent ?? "unknown agent"}`;
+	return `${title} · ${terminalSanitize(result?.agent ?? args.agent ?? "unknown agent")}`;
 }
 
 function classifyOutcome(
@@ -274,7 +291,7 @@ export function renderSubagentSupervisorMessage(message: any, theme: Theme): Com
 	const startedAt = details?.startedAt ?? finishedAt;
 	const visual = supervisorVisual(details?.jobStatus);
 	const timestamp = theme.fg("dim", `[${formatClock(finishedAt)}]`);
-	const label = theme.fg("toolTitle", theme.bold(`subagent job ${visual.label}`));
+	const label = theme.fg("toolTitle", theme.bold(`subagent job ${terminalSanitize(visual.label)}`));
 	const counts = taskCounts(details);
 	const countSummary = counts.failed === 0 && counts.pending === 0 && counts.running === 0
 		? `${counts.succeeded}/${counts.total} succeeded`
@@ -313,7 +330,7 @@ function describeJobsResult(args: SubagentJobsArgs, result: any, isError: boolea
 		for (const job of jobs) {
 			if (job.jobStatus) statuses.set(job.jobStatus, (statuses.get(job.jobStatus) ?? 0) + 1);
 		}
-		const summary = [...statuses.entries()].map(([status, count]) => `${count} ${status}`).join(" · ");
+		const summary = [...statuses.entries()].map(([status, count]) => `${count} ${terminalSanitize(String(status))}`).join(" · ");
 		return `${jobs.length} job${jobs.length === 1 ? "" : "s"}${summary ? ` · ${summary}` : ""}`;
 	}
 
@@ -323,7 +340,7 @@ function describeJobsResult(args: SubagentJobsArgs, result: any, isError: boolea
 		return `${shortJobId(args.jobId)} · ${text}`;
 	}
 	const elapsed = formatElapsed(Math.max(0, (details.finishedAt ?? Date.now()) - (details.startedAt ?? Date.now())));
-	return `${shortJobId(details.jobId ?? args.jobId)} · ${details.jobStatus ?? (isError ? "failed" : "completed")} · ${formatTaskCounts(details)} · ${elapsed}`;
+	return `${shortJobId(details.jobId ?? args.jobId)} · ${terminalSanitize(String(details.jobStatus ?? (isError ? "failed" : "completed")))} · ${formatTaskCounts(details)} · ${elapsed}`;
 }
 
 function updateJobsCall(
@@ -342,7 +359,7 @@ function updateJobsCall(
 			: failed
 				? theme.fg("error", "✗")
 				: theme.fg("success", "✓");
-	const action = args.action ?? "unknown";
+	const action = terminalSanitize(String(args.action ?? "unknown"));
 	const invocation = action === "list"
 		? "list"
 		: `${action} · ${shortJobId(args.jobId)}${action === "status" && args.includeOutput ? " · output requested" : ""}`;
@@ -387,6 +404,8 @@ function stateFromResult(
 	details: SubagentDetails | SubagentJobsDetails | undefined,
 	isError: boolean,
 ): void {
-	state.resultDetails = details && "jobs" in details ? details : { jobs: details ? [details] : [] };
+	if (!details) state.resultDetails = { jobs: [] };
+	else if ("jobs" in details) state.resultDetails = details as SubagentJobsDetails;
+	else state.resultDetails = { jobs: [details as SubagentDetails] };
 	state.isError = isError;
 }

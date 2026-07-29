@@ -28,6 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
 import { SubagentJobsParams, SubagentParams } from "./schema.ts";
+import { buildChildEnvironment, quoteExactPath, referencedEnvironmentNames, terminalSanitize } from "./security.ts";
 import { createSubagentStatusPublisher } from "./status-publisher.ts";
 import {
 	renderSubagentSupervisorMessage,
@@ -52,15 +53,20 @@ const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const SUPERVISOR_MESSAGE_CAP = 50 * 1024;
 const STATUS_DETAIL_OUTPUT_CAP = 4 * 1024;
 const STATUS_DETAIL_TOTAL_CAP = 20 * 1024;
+const PERSISTED_TASK_OUTPUT_CAP = 50 * 1024;
+const RESULT_DIAGNOSTIC_CAP = 4 * 1024;
+const RESULT_DETAILS_DIAGNOSTIC_TOTAL_CAP = 20 * 1024;
+const RESULT_METADATA_FIELD_CAP = 512;
+const SHUTDOWN_WAIT_MS = 7_500;
 
 function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
-		if (msg.role === "assistant") {
-			for (const part of msg.content) {
-				if (part.type === "text") return part.text;
-			}
-		}
+		if (msg.role !== "assistant") continue;
+		return msg.content
+			.filter((part): part is Extract<typeof part, { type: "text" }> => part.type === "text")
+			.map((part) => part.text)
+			.join("\n");
 	}
 	return "";
 }
@@ -77,24 +83,60 @@ function getResultOutput(result: SingleResult): string {
 }
 
 function truncateUtf8(output: string, cap: number, suffixLabel: string): string {
-	const byteLength = Buffer.byteLength(output, "utf8");
-	if (byteLength <= cap) return output;
+	if (cap <= 0) return "";
+	const bytes = Buffer.from(output, "utf8");
+	if (bytes.byteLength <= cap) return output;
 
-	let truncated = output.slice(0, cap);
-	while (Buffer.byteLength(truncated, "utf8") > cap) {
-		truncated = truncated.slice(0, -1);
-	}
-	return `${truncated}\n\n[${suffixLabel}: ${byteLength - Buffer.byteLength(truncated, "utf8")} bytes omitted.]`;
+	const suffix = `\n\n[${suffixLabel}.]`;
+	const suffixBytes = Buffer.byteLength(suffix, "utf8");
+	if (suffixBytes >= cap) return Buffer.from(suffix, "utf8").subarray(0, cap).toString("utf8").replace(/\uFFFD$/, "");
+
+	let prefix = bytes.subarray(0, cap - suffixBytes).toString("utf8").replace(/\uFFFD$/, "");
+	while (Buffer.byteLength(prefix, "utf8") + suffixBytes > cap) prefix = prefix.slice(0, -1);
+	return `${prefix}${suffix}`;
+}
+
+/** Best-effort removal of common credentials before text leaves runtime-only child state. */
+function redactSensitiveText(value: string): string {
+	return value
+		.replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "<private key redacted>")
+		.replace(/(\b(?:proxy-)?authorization\s*:\s*(?:bearer|basic)\s+)[^\s,;]+/gi, "$1<redacted>")
+		.replace(
+			/((?:["']?)(?:api[-_ ]?key|access[-_ ]?token|refresh[-_ ]?token|token|secret|password|passwd|credential|cookie|signature)(?:["']?)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,
+			"$1<redacted>",
+		)
+		.replace(/\b(?:sk-[A-Za-z0-9_-]{12,}|gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b/g, "<redacted>")
+		.replace(/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "<jwt redacted>")
+		.replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, "$1<credentials redacted>@");
+}
+
+function sanitizeBounded(value: string, cap: number, suffixLabel: string): string {
+	return truncateUtf8(terminalSanitize(redactSensitiveText(value)), cap, suffixLabel);
 }
 
 function truncateParallelOutput(output: string): string {
-	return truncateUtf8(output, PER_TASK_OUTPUT_CAP, "Output truncated");
+	return sanitizeBounded(output, PER_TASK_OUTPUT_CAP, "Output truncated");
+}
+
+function appendBounded(current: string, addition: string, cap: number, suffixLabel = "Diagnostic output truncated"): string {
+	if (Buffer.byteLength(current, "utf8") >= cap) return current;
+	return truncateUtf8(current + addition, cap, suffixLabel);
 }
 
 function compactDiagnostic(value: string | undefined, maxChars = 240): string | undefined {
-	const compact = value?.replace(/\s+/g, " ").trim();
+	const compact = value ? terminalSanitize(redactSensitiveText(value)).replace(/\s+/g, " ").trim() : undefined;
 	if (!compact) return undefined;
 	return compact.length > maxChars ? `${compact.slice(0, maxChars - 3)}...` : compact;
+}
+
+function effectiveModel(provider: string | undefined, model: string | undefined): string | undefined {
+	if (!model) return undefined;
+	if (!provider || model.startsWith(`${provider}/`)) return model;
+	return `${provider}/${model}`;
+}
+
+function boundedMetadata(value: string, cap = RESULT_METADATA_FIELD_CAP): string {
+	return sanitizeBounded(value, cap, "Metadata truncated").replace(/ +/g, " ").trim();
 }
 
 async function mapWithConcurrencyLimit<TIn, TOut>(
@@ -113,7 +155,9 @@ async function mapWithConcurrencyLimit<TIn, TOut>(
 			results[current] = await fn(items[current], current);
 		}
 	});
-	await Promise.all(workers);
+	const settled = await Promise.allSettled(workers);
+	const rejected = settled.find((result): result is PromiseRejectedResult => result.status === "rejected");
+	if (rejected) throw rejected.reason;
 	return results;
 }
 
@@ -155,6 +199,7 @@ interface BackgroundTask {
 	completed: boolean;
 	output?: string;
 	result?: SingleResult;
+	model?: string;
 }
 
 interface BackgroundJob {
@@ -163,12 +208,14 @@ interface BackgroundJob {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	defaultCwd: string;
+	confirmProjectAgents: boolean;
 	tasks: BackgroundTask[];
 	status: BackgroundJobStatus;
 	startedAt: number;
 	finishedAt?: number;
 	controller?: AbortController;
 	completion?: Promise<void>;
+	runtimeGeneration?: number;
 }
 
 interface PersistedBackgroundJob {
@@ -177,13 +224,40 @@ interface PersistedBackgroundJob {
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	defaultCwd: string;
+	confirmProjectAgents?: boolean;
 	tasks: Array<Omit<BackgroundTask, "result">>;
 	status: BackgroundJobStatus;
 	startedAt: number;
 	finishedAt?: number;
 }
 
-const JOB_ENTRY_TYPE = "subagent-supervisor-job";
+interface PersistedJobDefinition {
+	id: string;
+	mode: SubagentMode;
+	agentScope: AgentScope;
+	projectAgentsDir: string | null;
+	defaultCwd: string;
+	confirmProjectAgents: boolean;
+	tasks: Array<Pick<BackgroundTask, "agent" | "title" | "task" | "cwd" | "sessionId" | "model">>;
+	startedAt: number;
+}
+
+interface PersistedJobState {
+	id: string;
+	status?: BackgroundJobStatus;
+	finishedAt?: number | null;
+	task?: {
+		index: number;
+		attempts: number;
+		completed: boolean;
+		output?: string | null;
+		model?: string;
+	};
+}
+
+const LEGACY_JOB_ENTRY_TYPE = "subagent-supervisor-job";
+const JOB_DEFINITION_ENTRY_TYPE = "subagent-supervisor-definition";
+const JOB_STATE_ENTRY_TYPE = "subagent-supervisor-state";
 
 async function runSingleAgent(
 	defaultCwd: string,
@@ -194,6 +268,9 @@ async function runSingleAgent(
 	step: number | undefined,
 	signal: AbortSignal | undefined,
 	sessionId: string | undefined,
+	inheritedModel: string | null | undefined,
+	provider: string | undefined,
+	providerEnvironmentNames: readonly string[],
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onStatusUpdate?: (result: SingleResult) => void,
@@ -217,7 +294,12 @@ async function runSingleAgent(
 	const args: string[] = ["--mode", "json", "-p"];
 	if (sessionId) args.push("--session-id", sessionId);
 	else args.push("--no-session");
-	if (agent.model) args.push("--model", agent.model);
+	// Callers pass the already resolved effective model. This also preserves the
+	// model selected when a persisted child session is resumed.
+	// `null` means a legacy persisted child whose original effective model was
+	// not recorded. Omit --model so Pi can restore it from the child session.
+	const selectedModel = inheritedModel === null ? undefined : inheritedModel ?? agent.model;
+	if (selectedModel) args.push("--model", selectedModel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -231,7 +313,7 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: selectedModel,
 		step,
 	};
 
@@ -263,7 +345,7 @@ async function runSingleAgent(
 				shell: false,
 				stdio: ["ignore", "pipe", "pipe"],
 				env: {
-					...process.env,
+					...buildChildEnvironment(process.env, provider, providerEnvironmentNames),
 					PI_SUBAGENT_ACTIVE: "1",
 					[SUBAGENT_DEPTH_ENV]: String(getSubagentDepth() + 1),
 				},
@@ -297,9 +379,12 @@ async function runSingleAgent(
 							currentResult.usage.cost += usage.cost?.total || 0;
 							currentResult.usage.contextTokens = usage.totalTokens || 0;
 						}
-						if (!currentResult.model && msg.model) currentResult.model = msg.model;
+						if (msg.provider) currentResult.provider = boundedMetadata(msg.provider);
+						if (msg.model) currentResult.model = boundedMetadata(msg.model);
 						if (msg.stopReason) currentResult.stopReason = msg.stopReason;
-						if (msg.errorMessage) currentResult.errorMessage = msg.errorMessage;
+						if (msg.errorMessage) {
+							currentResult.errorMessage = sanitizeBounded(msg.errorMessage, RESULT_DIAGNOSTIC_CAP, "Error truncated");
+						}
 					}
 					emitUpdate();
 				}
@@ -318,20 +403,38 @@ async function runSingleAgent(
 			});
 
 			proc.stderr.on("data", (data) => {
-				currentResult.stderr += data.toString();
+				currentResult.stderr = appendBounded(
+					currentResult.stderr,
+					terminalSanitize(redactSensitiveText(data.toString())),
+					RESULT_DIAGNOSTIC_CAP,
+				);
 			});
 
-			proc.on("close", (code) => {
+			proc.on("close", (code, signalName) => {
 				processClosed = true;
 				if (forceKillTimer) clearTimeout(forceKillTimer);
 				if (signal && abortListener) signal.removeEventListener("abort", abortListener);
 				if (buffer.trim()) processLine(buffer);
-				resolve(code ?? 0);
+				if (code === null) {
+					currentResult.stderr = appendBounded(
+						currentResult.stderr,
+							`${currentResult.stderr ? "\n" : ""}Subagent process terminated by ${signalName ?? "an unknown signal"}`,
+						RESULT_DIAGNOSTIC_CAP,
+					);
+					resolve(1);
+					return;
+				}
+				resolve(code);
 			});
 
 			proc.on("error", (error) => {
-				currentResult.stderr += `${currentResult.stderr ? "\n" : ""}${error.message}`;
-				resolve(1);
+				// `close` follows both spawn failures and runtime process errors; let it
+				// perform the single cleanup/settlement path.
+				currentResult.stderr = appendBounded(
+					currentResult.stderr,
+					`${currentResult.stderr ? "\n" : ""}${terminalSanitize(redactSensitiveText(error.message))}`,
+					RESULT_DIAGNOSTIC_CAP,
+				);
 			});
 
 			if (signal) {
@@ -375,6 +478,27 @@ function getSubagentDepth(): number {
 	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
+function getContextModel(ctx: ExtensionContext): string | undefined {
+	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+}
+
+function selectedProvider(agents: AgentConfig[], agentName: string, ctx: ExtensionContext): string | undefined {
+	const configuredModel = agents.find((agent) => agent.name === agentName)?.model;
+	if (!configuredModel) return ctx.model?.provider;
+	if (configuredModel.includes("/")) return configuredModel.split("/", 1)[0];
+	const modelId = configuredModel.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/, "");
+	const matchingProviders = [...new Set(ctx.modelRegistry.getAll().filter((model) => model.id === modelId).map((model) => model.provider))];
+	return matchingProviders.length === 1 ? matchingProviders[0] : ctx.model?.provider;
+}
+
+function selectedProviderEnvironmentNames(provider: string | undefined, ctx: ExtensionContext): string[] {
+	if (!provider) return [];
+	// Registered provider API-key/header templates are the ambient inputs needed
+	// by user-defined relays. Provider env stored in auth.json is loaded directly
+	// by the child and therefore does not need ambient inheritance.
+	return referencedEnvironmentNames(ctx.modelRegistry.getRegisteredProviderConfig(provider));
+}
+
 export default function (pi: ExtensionAPI) {
 	// Subagents may recursively spawn children until the configured depth.
 	// At the maximum depth, this extension is not registered, making that
@@ -384,6 +508,7 @@ export default function (pi: ExtensionAPI) {
 	const { whileRunning } = createSubagentStatusPublisher(pi);
 	const jobs = new Map<string, BackgroundJob>();
 	let shuttingDown = false;
+	let lifecycleGeneration = 0;
 	let activeSubagentSlots = 0;
 	type SlotWaiter = {
 		resolve: (release: () => void) => void;
@@ -436,24 +561,83 @@ export default function (pi: ExtensionAPI) {
 		}
 	};
 
-	const persistJob = (job: BackgroundJob) => {
-		if (shuttingDown) return;
-		const persisted: PersistedBackgroundJob = {
+	const isCurrentRuntime = (job: BackgroundJob, generation = job.runtimeGeneration): boolean =>
+		generation === lifecycleGeneration && !shuttingDown;
+
+	const isJobRuntimeCurrent = (job: BackgroundJob, generation: number): boolean =>
+		job.runtimeGeneration === generation && generation === lifecycleGeneration;
+
+	const persistJobDefinition = (job: BackgroundJob) => {
+		if (job.runtimeGeneration !== lifecycleGeneration || shuttingDown) return;
+		const persisted: PersistedJobDefinition = {
 			id: job.id,
 			mode: job.mode,
 			agentScope: job.agentScope,
 			projectAgentsDir: job.projectAgentsDir,
 			defaultCwd: job.defaultCwd,
-			tasks: job.tasks.map(({ result: _result, ...task }) => task),
-			status: job.status,
+			confirmProjectAgents: job.confirmProjectAgents,
+			tasks: job.tasks.map(({ agent, title, task, cwd, sessionId, model }) => ({
+				agent,
+				title,
+				task,
+				cwd,
+				sessionId,
+				model,
+			})),
 			startedAt: job.startedAt,
-			finishedAt: job.finishedAt,
 		};
-		pi.appendEntry(JOB_ENTRY_TYPE, persisted);
+		pi.appendEntry(JOB_DEFINITION_ENTRY_TYPE, persisted);
 	};
 
-	const jobResults = (job: BackgroundJob): SingleResult[] =>
-		job.tasks.map((task) => task.result).filter((result): result is SingleResult => Boolean(result));
+	const persistJobState = (job: BackgroundJob, taskIndex?: number) => {
+		if (job.runtimeGeneration !== undefined && job.runtimeGeneration !== lifecycleGeneration) return;
+		const task = taskIndex === undefined ? undefined : job.tasks[taskIndex];
+		const persisted: PersistedJobState = {
+			id: job.id,
+			status: job.status,
+			finishedAt: job.finishedAt ?? null,
+			task: task && taskIndex !== undefined
+				? {
+					index: taskIndex,
+					attempts: task.attempts,
+					completed: task.completed,
+					output: task.output ?? null,
+					model: task.model,
+				}
+				: undefined,
+		};
+		pi.appendEntry(JOB_STATE_ENTRY_TYPE, persisted);
+	};
+
+	const jobResults = (job: BackgroundJob): SingleResult[] => {
+		const results: SingleResult[] = [];
+		let diagnosticBytes = 0;
+		for (const task of job.tasks) {
+			const result = task.result;
+			if (!result) continue;
+			const hasErrorMessage = Boolean(result.errorMessage);
+			const remainingDiagnosticBytes = Math.max(0, RESULT_DETAILS_DIAGNOSTIC_TOTAL_CAP - diagnosticBytes);
+			const diagnostic = sanitizeBounded(
+				result.errorMessage ?? result.stderr,
+				Math.min(RESULT_DIAGNOSTIC_CAP, remainingDiagnosticBytes),
+				"Diagnostic output truncated",
+			);
+			diagnosticBytes += Buffer.byteLength(diagnostic, "utf8");
+			results.push({
+				...result,
+				// Delegated prompts and child messages can contain source or credentials.
+				// They are unnecessary for background rendering and never enter details.
+				task: "[omitted from background details]",
+				messages: [],
+				stderr: hasErrorMessage ? "" : diagnostic,
+				errorMessage: hasErrorMessage ? diagnostic : undefined,
+				agent: boundedMetadata(result.agent),
+				provider: result.provider ? boundedMetadata(result.provider) : undefined,
+				model: result.model ? boundedMetadata(result.model) : undefined,
+			});
+		}
+		return results;
+	};
 
 	const taskState = (job: BackgroundJob, task: BackgroundTask): SubagentJobTaskState => {
 		if (task.completed) return "succeeded";
@@ -466,7 +650,7 @@ export default function (pi: ExtensionAPI) {
 	const jobDetails = (job: BackgroundJob): SubagentDetails => ({
 		mode: job.mode,
 		agentScope: job.agentScope,
-		projectAgentsDir: job.projectAgentsDir,
+		projectAgentsDir: job.projectAgentsDir ? boundedMetadata(job.projectAgentsDir, 2 * 1024) : null,
 		results: jobResults(job),
 		background: true,
 		jobId: job.id,
@@ -474,11 +658,12 @@ export default function (pi: ExtensionAPI) {
 		startedAt: job.startedAt,
 		finishedAt: job.finishedAt,
 		tasks: job.tasks.map((task) => ({
-			agent: task.agent,
-			title: task.title,
-			sessionId: task.sessionId,
+			agent: boundedMetadata(task.agent),
+			title: boundedMetadata(task.title),
+			sessionId: boundedMetadata(task.sessionId),
 			attempts: task.attempts,
 			completed: task.completed,
+			model: task.model ? boundedMetadata(task.model) : undefined,
 			state: taskState(job, task),
 		})),
 	});
@@ -488,9 +673,9 @@ export default function (pi: ExtensionAPI) {
 		for (const task of job.tasks) counts[taskState(job, task)]++;
 		const elapsed = Math.max(0, (job.finishedAt ?? Date.now()) - job.startedAt);
 		const lines = [
-			`jobId: ${job.id}`,
-			`status: ${job.status}`,
-			`mode: ${job.mode}`,
+			`jobId: ${boundedMetadata(job.id)}`,
+			`status: ${boundedMetadata(String(job.status))}`,
+			`mode: ${boundedMetadata(String(job.mode))}`,
 			`tasks: ${job.tasks.length} total · ${counts.succeeded} succeeded · ${counts.failed} failed · ${counts.running} running · ${counts.pending} pending`,
 			`elapsedMs: ${elapsed}`,
 			`started: ${new Date(job.startedAt).toISOString()}`,
@@ -500,16 +685,16 @@ export default function (pi: ExtensionAPI) {
 		const failures = job.tasks.filter((task) => taskState(job, task) === "failed");
 		for (const [index, task] of failures.slice(0, 5).entries()) {
 			const diagnostic = compactDiagnostic(task.output ?? task.result?.errorMessage ?? task.result?.stderr);
-			lines.push(`failure ${index + 1}: ${task.title} (${task.agent})${diagnostic ? ` · ${diagnostic}` : ""}`);
+			lines.push(`failure ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent)})${diagnostic ? ` · ${diagnostic}` : ""}`);
 		}
 		if (failures.length > 5) lines.push(`failures: +${failures.length - 5} more`);
 
 		if (includeOutput) {
-			lines.push("", `Task output (opt-in; max ${STATUS_DETAIL_OUTPUT_CAP / 1024} KB per task, ${STATUS_DETAIL_TOTAL_CAP / 1024} KB total):`);
+			lines.push("", `Task output (opt-in; redacted; max ${STATUS_DETAIL_OUTPUT_CAP / 1024} KB per task, ${STATUS_DETAIL_TOTAL_CAP / 1024} KB total):`);
 			for (const [index, task] of job.tasks.entries()) {
 				if (!task.output) continue;
-				lines.push(`\n### task ${index + 1}: ${task.title} (${task.agent}) · ${taskState(job, task)}`);
-				lines.push(truncateUtf8(task.output, STATUS_DETAIL_OUTPUT_CAP, "Task output truncated"));
+				lines.push(`\n### task ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent)}) · ${taskState(job, task)}`);
+				lines.push(sanitizeBounded(task.output, STATUS_DETAIL_OUTPUT_CAP, "Task output truncated"));
 			}
 			return truncateUtf8(lines.join("\n"), STATUS_DETAIL_TOTAL_CAP, "Detailed status truncated");
 		}
@@ -519,9 +704,9 @@ export default function (pi: ExtensionAPI) {
 	const notifySupervisorEvent = (job: BackgroundJob) => {
 		if (shuttingDown) return;
 		const action = job.status === "completed" ? "Use the results below." : "The job can be resumed with subagent_jobs action=resume.";
-		const content = truncateUtf8(
+		const content = sanitizeBounded(
 			[
-				`[Subagent supervisor event] Background job ${job.id} is ${job.status}.`,
+				`[Subagent supervisor event] Background job ${boundedMetadata(job.id)} is ${boundedMetadata(String(job.status))}.`,
 				action,
 				"This notification is one-way: do not wait for the child process, and do not assume the child is waiting for you.",
 				"",
@@ -529,7 +714,7 @@ export default function (pi: ExtensionAPI) {
 				"",
 				"Completed task outputs (bounded for the parent model):",
 				...job.tasks.map((task, index) =>
-					`\n### task ${index + 1}: ${task.title} (${task.agent}) · ${taskState(job, task)}\n${truncateParallelOutput(task.output ?? "(no output)")}`,
+					`\n### task ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent)}) · ${taskState(job, task)}\n${truncateParallelOutput(task.output ?? "(no output)")}`,
 				),
 			].join("\n"),
 			SUPERVISOR_MESSAGE_CAP,
@@ -553,17 +738,27 @@ export default function (pi: ExtensionAPI) {
 		continuation?: string,
 	) => {
 		if (job.status === "running") return;
+		const runGeneration = lifecycleGeneration;
 		job.status = "running";
 		job.finishedAt = undefined;
+		job.runtimeGeneration = runGeneration;
 		const controller = new AbortController();
 		job.controller = controller;
-		persistJob(job);
+		persistJobState(job);
 
 		try {
 			const executeTask = async (task: BackgroundTask, index: number, prompt: string): Promise<SingleResult> => {
+				const isPersistedResume = task.attempts > 0;
 				task.attempts++;
-				const configuredModel = agents.find((agent) => agent.name === task.agent)?.model;
-				persistJob(job);
+				task.completed = false;
+				task.output = undefined;
+				task.result = undefined;
+				if (!isPersistedResume) {
+					task.model ??= agents.find((agent) => agent.name === task.agent)?.model ?? getContextModel(ctx);
+				}
+				if (!isJobRuntimeCurrent(job, runGeneration)) throw new Error("Subagent runtime was retired");
+				persistJobState(job, index);
+				const selectedModel = isPersistedResume && !task.model ? null : task.model;
 				const result = await withSubagentSlot(controller.signal, () =>
 					whileRunning(
 						task.agent,
@@ -579,17 +774,31 @@ export default function (pi: ExtensionAPI) {
 								job.mode === "chain" ? index + 1 : undefined,
 								controller.signal,
 								task.sessionId,
+								selectedModel,
+								selectedModel?.includes("/") ? selectedModel.split("/", 1)[0] : selectedProvider(agents, task.agent, ctx),
+								selectedProviderEnvironmentNames(selectedModel?.includes("/") ? selectedModel.split("/", 1)[0] : selectedProvider(agents, task.agent, ctx), ctx),
 								undefined,
 								(results) => ({ ...jobDetails(job), results }),
-								onStatusUpdate,
+								(result) => {
+									if (!isJobRuntimeCurrent(job, runGeneration)) return;
+									const observedModel = effectiveModel(result.provider, result.model);
+									if (observedModel && observedModel !== task.model) {
+										task.model = observedModel;
+										persistJobState(job, index);
+									}
+									onStatusUpdate(result);
+								},
 							),
-						configuredModel,
+						task.model,
 					),
 				);
+				if (!isJobRuntimeCurrent(job, runGeneration)) return result;
 				task.result = result;
-				task.output = getResultOutput(result);
+				const fullOutput = getResultOutput(result);
+				task.output = sanitizeBounded(fullOutput, PERSISTED_TASK_OUTPUT_CAP, "Persisted task output truncated");
+				task.model = effectiveModel(result.provider, result.model) ?? task.model;
 				task.completed = !isFailedResult(result);
-				persistJob(job);
+				persistJobState(job, index);
 				return result;
 			};
 
@@ -606,7 +815,7 @@ export default function (pi: ExtensionAPI) {
 						: original;
 					const result = await executeTask(task, index, prompt);
 					if (isFailedResult(result)) break;
-					previousOutput = task.output ?? "";
+					previousOutput = getResultOutput(result);
 				}
 			} else {
 				const pending = job.tasks.map((task, index) => ({ task, index })).filter(({ task }) => !task.completed);
@@ -618,19 +827,28 @@ export default function (pi: ExtensionAPI) {
 				});
 			}
 
-			if (job.status === "canceling" || controller.signal.aborted) job.status = "canceled";
+			if (!isJobRuntimeCurrent(job, runGeneration)) return;
+			if (controller.signal.aborted && shuttingDown) job.status = "interrupted";
+			else if (controller.signal.aborted) job.status = "canceled";
 			else if (job.tasks.every((task) => task.completed)) job.status = "completed";
 			else job.status = "interrupted";
 		} catch (error) {
-			job.status = controller.signal.aborted ? "canceled" : "interrupted";
+			if (!isJobRuntimeCurrent(job, runGeneration)) return;
+			job.status = shuttingDown ? "interrupted" : controller.signal.aborted ? "canceled" : "interrupted";
 			const pending = job.tasks.find((task) => !task.completed);
-			if (pending) pending.output = error instanceof Error ? error.message : String(error);
+			if (pending) {
+				pending.output = sanitizeBounded(
+					error instanceof Error ? error.message : String(error),
+					RESULT_DIAGNOSTIC_CAP,
+					"Error truncated",
+				);
+			}
 		} finally {
-			job.controller = undefined;
-			job.finishedAt = Date.now();
-			persistJob(job);
-			if (!shuttingDown) {
-				ctx.ui.notify(`Subagent job ${job.id} ${job.status}`, job.status === "completed" ? "info" : "warning");
+			if (!isJobRuntimeCurrent(job, runGeneration)) return;
+			job.finishedAt ??= Date.now();
+			persistJobState(job);
+			if (isCurrentRuntime(job, runGeneration)) {
+				ctx.ui.notify(`Subagent job ${boundedMetadata(job.id)} ${boundedMetadata(String(job.status))}`, job.status === "completed" ? "info" : "warning");
 				notifySupervisorEvent(job);
 			}
 		}
@@ -641,40 +859,108 @@ export default function (pi: ExtensionAPI) {
 	);
 
 	pi.on("session_start", (_event, ctx) => {
+		lifecycleGeneration++;
 		shuttingDown = false;
-		jobs.clear();
-		const latest = new Map<string, PersistedBackgroundJob>();
-		for (const entry of ctx.sessionManager.getBranch()) {
-			if (entry.type !== "custom" || entry.customType !== JOB_ENTRY_TYPE) continue;
-			const data = entry.data as PersistedBackgroundJob | undefined;
-			if (data?.id) latest.set(data.id, data);
+		for (const job of jobs.values()) {
+			job.runtimeGeneration = -1;
+			job.controller?.abort();
 		}
-		for (const data of latest.values()) {
-			jobs.set(data.id, {
-				...data,
-				status: data.status === "running" || data.status === "canceling" ? "interrupted" : data.status,
-				tasks: data.tasks.map((task) => ({ ...task })),
-			});
+		jobs.clear();
+		for (const entry of ctx.sessionManager.getBranch()) {
+			if (entry.type !== "custom") continue;
+			if (entry.customType === LEGACY_JOB_ENTRY_TYPE) {
+				const data = entry.data as PersistedBackgroundJob | undefined;
+				if (!data?.id) continue;
+				jobs.set(data.id, {
+					...data,
+					confirmProjectAgents: data.confirmProjectAgents ?? true,
+					status: data.status === "running" || data.status === "canceling" ? "interrupted" : data.status,
+					tasks: data.tasks.map((task) => ({ ...task })),
+				});
+				continue;
+			}
+			if (entry.customType === JOB_DEFINITION_ENTRY_TYPE) {
+				const data = entry.data as PersistedJobDefinition | undefined;
+				if (!data?.id) continue;
+				jobs.set(data.id, {
+					id: data.id,
+					mode: data.mode,
+					agentScope: data.agentScope,
+					projectAgentsDir: data.projectAgentsDir,
+					defaultCwd: data.defaultCwd,
+					confirmProjectAgents: data.confirmProjectAgents,
+					tasks: data.tasks.map((task) => ({ ...task, attempts: 0, completed: false })),
+					status: "interrupted",
+					startedAt: data.startedAt,
+				});
+				continue;
+			}
+			if (entry.customType === JOB_STATE_ENTRY_TYPE) {
+				const data = entry.data as PersistedJobState | undefined;
+				const job = data?.id ? jobs.get(data.id) : undefined;
+				if (!job || !data) continue;
+				if (data.status) job.status = data.status;
+				if (data.finishedAt === null) delete job.finishedAt;
+				else if (data.finishedAt !== undefined) job.finishedAt = data.finishedAt;
+				if (data.task) {
+					const task = job.tasks[data.task.index];
+					if (task) {
+						task.attempts = data.task.attempts;
+						task.completed = data.task.completed;
+						if (data.task.output === null) delete task.output;
+						else if (data.task.output !== undefined) task.output = data.task.output;
+						if (data.task.model !== undefined) task.model = data.task.model;
+					}
+				}
+			}
+		}
+		for (const job of jobs.values()) {
+			job.runtimeGeneration = lifecycleGeneration;
+			if (job.status === "running" || job.status === "canceling") job.status = "interrupted";
 		}
 	});
 
 	pi.on("session_shutdown", async () => {
+		const shutdownGeneration = lifecycleGeneration;
 		const completions: Promise<void>[] = [];
+		const activeJobs: BackgroundJob[] = [];
 		for (const job of jobs.values()) {
 			if (job.status === "running" || job.status === "canceling") {
 				job.status = "interrupted";
 				job.finishedAt = Date.now();
-				persistJob(job);
-				job.controller?.abort();
+				persistJobState(job);
+				activeJobs.push(job);
 			}
 			if (job.completion) completions.push(job.completion);
 		}
+
+		// Persist interruption before aborting. Finalizers may then add task deltas
+		// while shutdown waits, but can never write after this lifecycle retires.
 		shuttingDown = true;
+		for (const job of activeJobs) job.controller?.abort();
 		for (const waiter of slotWaiters.splice(0)) {
 			waiter.signal.removeEventListener("abort", waiter.onAbort);
 			waiter.reject(new Error("Session is shutting down"));
 		}
-		await Promise.allSettled(completions);
+		if (completions.length > 0) {
+			await Promise.race([
+				Promise.allSettled(completions),
+				new Promise<void>((resolve) => {
+					const timer = setTimeout(resolve, SHUTDOWN_WAIT_MS);
+					timer.unref?.();
+				}),
+			]);
+		}
+		if (lifecycleGeneration !== shutdownGeneration) return;
+		for (const job of activeJobs) {
+			job.status = "interrupted";
+			job.finishedAt ??= Date.now();
+			persistJobState(job);
+			// Retire this job even if other shutdown hooks start a replacement
+			// session before this hook returns.
+			job.runtimeGeneration = -1;
+		}
+		lifecycleGeneration++;
 	});
 
 	pi.registerTool({
@@ -697,12 +983,26 @@ export default function (pi: ExtensionAPI) {
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const agentScope: AgentScope = params.agentScope ?? "user";
-			const discovery = discoverAgents(ctx.cwd, agentScope);
+			if (agentScope !== "user" && !ctx.isProjectTrusted()) {
+				return {
+					content: [{ type: "text", text: "Project-local agents require a trusted project." }],
+					details: {
+						mode: "single" as const,
+						agentScope,
+						projectAgentsDir: null,
+						results: [],
+					},
+					isError: true,
+				};
+			}
+			const discovery = discoverAgents(ctx.cwd, agentScope, ctx.cwd);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
+			const invalidBatchTitle = [...(params.chain ?? []), ...(params.tasks ?? [])]
+				.some((item) => !item.title.trim());
 			const hasSingle = Boolean(params.agent && params.task && params.title?.trim());
 			const incompleteSingle = Boolean(params.agent || params.task || params.title) && !hasSingle;
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
@@ -716,7 +1016,7 @@ export default function (pi: ExtensionAPI) {
 					results,
 				});
 
-			if (modeCount !== 1 || incompleteSingle) {
+			if (modeCount !== 1 || incompleteSingle || invalidBatchTitle) {
 				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
 					content: [
@@ -740,8 +1040,8 @@ export default function (pi: ExtensionAPI) {
 					.filter((a): a is AgentConfig => a?.source === "project");
 
 				if (projectAgentsRequested.length > 0) {
-					const names = projectAgentsRequested.map((a) => a.name).join(", ");
-					const dir = discovery.projectAgentsDir ?? "(unknown)";
+					const names = projectAgentsRequested.map((a) => boundedMetadata(a.name)).join(", ");
+					const dir = discovery.projectAgentsDir ? quoteExactPath(discovery.projectAgentsDir) : "(unknown)";
 					const ok = await ctx.ui.confirm(
 						"Run project-local agents?",
 						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
@@ -780,10 +1080,12 @@ export default function (pi: ExtensionAPI) {
 				const jobId = `sub-${randomUUID()}`;
 				const job: BackgroundJob = {
 					id: jobId,
+					runtimeGeneration: lifecycleGeneration,
 					mode,
 					agentScope,
 					projectAgentsDir: discovery.projectAgentsDir,
 					defaultCwd: ctx.cwd,
+					confirmProjectAgents,
 					tasks: requested.map((item, index) => ({
 						agent: item.agent,
 						title: item.title.trim(),
@@ -792,20 +1094,15 @@ export default function (pi: ExtensionAPI) {
 						sessionId: `${jobId}-${index + 1}`,
 						attempts: 0,
 						completed: false,
+						model: agents.find((agent) => agent.name === item.agent)?.model ?? getContextModel(ctx),
 					})),
 					status: "interrupted",
 					startedAt: Date.now(),
 				};
 				jobs.set(job.id, job);
-				persistJob(job);
-				job.completion = runBackgroundJob(job, agents, ctx).catch((error) => {
-					job.status = "interrupted";
-					job.finishedAt = Date.now();
-					const pending = job.tasks.find((task) => !task.completed);
-					if (pending) pending.output = error instanceof Error ? error.message : String(error);
-					persistJob(job);
-					notifySupervisorEvent(job);
-				});
+				persistJobDefinition(job);
+				persistJobState(job);
+				job.completion = runBackgroundJob(job, agents, ctx);
 
 				return {
 					content: [{
@@ -855,11 +1152,14 @@ export default function (pi: ExtensionAPI) {
 									i + 1,
 									signal,
 									undefined,
+									agents.find((agent) => agent.name === step.agent)?.model ?? getContextModel(ctx),
+									selectedProvider(agents, step.agent, ctx),
+									selectedProviderEnvironmentNames(selectedProvider(agents, step.agent, ctx), ctx),
 									chainUpdate,
 									makeDetails("chain"),
 									onStatusUpdate,
 								),
-							agents.find((agent) => agent.name === step.agent)?.model,
+							agents.find((agent) => agent.name === step.agent)?.model ?? getContextModel(ctx),
 						),
 					);
 					results.push(result);
@@ -868,7 +1168,7 @@ export default function (pi: ExtensionAPI) {
 					if (isError) {
 						const errorMsg = getResultOutput(result);
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${step.agent}): ${errorMsg}` }],
+							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${boundedMetadata(step.agent)}): ${sanitizeBounded(errorMsg, PER_TASK_OUTPUT_CAP, "Error output truncated")}` }],
 							details: makeDetails("chain")(results),
 							isError: true,
 						};
@@ -939,6 +1239,9 @@ export default function (pi: ExtensionAPI) {
 									undefined,
 									signal,
 									undefined,
+									agents.find((agent) => agent.name === t.agent)?.model ?? getContextModel(ctx),
+									selectedProvider(agents, t.agent, ctx),
+									selectedProviderEnvironmentNames(selectedProvider(agents, t.agent, ctx), ctx),
 									// Per-task update callback
 									(partial) => {
 										if (partial.details?.results[0]) {
@@ -949,7 +1252,7 @@ export default function (pi: ExtensionAPI) {
 									makeDetails("parallel"),
 									onStatusUpdate,
 								),
-							agents.find((agent) => agent.name === t.agent)?.model,
+							agents.find((agent) => agent.name === t.agent)?.model ?? getContextModel(ctx),
 						),
 					);
 					allResults[index] = result;
@@ -963,7 +1266,7 @@ export default function (pi: ExtensionAPI) {
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					return `### [${r.agent}] ${status}\n\n${output}`;
+					return `### [${boundedMetadata(r.agent)}] ${boundedMetadata(status)}\n\n${output}`;
 				});
 				return {
 					content: [
@@ -993,11 +1296,14 @@ export default function (pi: ExtensionAPI) {
 								undefined,
 								signal,
 								undefined,
+								agents.find((agent) => agent.name === params.agent)?.model ?? getContextModel(ctx),
+								selectedProvider(agents, params.agent!, ctx),
+								selectedProviderEnvironmentNames(selectedProvider(agents, params.agent!, ctx), ctx),
 								onUpdate,
 								makeDetails("single"),
 								onStatusUpdate,
 							),
-						agents.find((agent) => agent.name === params.agent)?.model,
+						agents.find((agent) => agent.name === params.agent)?.model ?? getContextModel(ctx),
 					),
 				);
 				const isError = isFailedResult(result);
@@ -1055,6 +1361,7 @@ export default function (pi: ExtensionAPI) {
 			if (!params.jobId) {
 				return {
 					content: [{ type: "text", text: `action=${params.action} requires jobId.` }],
+					details: { jobs: [] },
 					isError: true,
 				};
 			}
@@ -1063,6 +1370,7 @@ export default function (pi: ExtensionAPI) {
 			if (!job) {
 				return {
 					content: [{ type: "text", text: `Unknown subagent job: ${params.jobId}` }],
+					details: { jobs: [] },
 					isError: true,
 				};
 			}
@@ -1082,7 +1390,7 @@ export default function (pi: ExtensionAPI) {
 					};
 				}
 				job.status = "canceling";
-				persistJob(job);
+				persistJobState(job);
 				job.controller?.abort();
 				return {
 					content: [{ type: "text", text: `Cancellation requested for ${job.id}. The supervisor will notify the main agent when shutdown completes.` }],
@@ -1103,23 +1411,61 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const discovery = discoverAgents(job.defaultCwd, job.agentScope);
+			// ctx.isProjectTrusted() applies only to ctx.cwd and says nothing about
+			// an arbitrary cwd loaded from persisted job data. Pi exposes no
+			// arbitrary-path temporary/override trust query to extensions, so every
+			// project-agent resume requires an exact-path interactive approval.
+			if (job.agentScope !== "user") {
+				const executionPaths = [...new Set(job.tasks.map((task) => task.cwd ?? job.defaultCwd))];
+				const quotedExecutionPaths = executionPaths.map(quoteExactPath);
+				if (ctx.mode !== "tui" || !ctx.hasUI) {
+					return {
+						content: [{ type: "text", text: `Cannot resume ${job.id} noninteractively; project-local job path approval is required for: ${quotedExecutionPaths.join(", ")}` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+				const approved = await ctx.ui.confirm(
+					"Resume project job at exact path?",
+					`Persisted project-agent source cwd: ${quoteExactPath(job.defaultCwd)}\nPersisted child execution path${quotedExecutionPaths.length === 1 ? "" : "s"}:\n${quotedExecutionPaths.map((value) => `- ${value}`).join("\n")}\n\nThis approval is required on every resume and applies only to this attempt. Project agent files may have changed.`,
+				);
+				if (!approved) {
+					return {
+						content: [{ type: "text", text: `Canceled resume for ${job.id}; persisted project paths were not approved.` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+			}
+			const discovery = discoverAgents(job.defaultCwd, job.agentScope, job.defaultCwd);
+			if (job.agentScope !== "user" && job.confirmProjectAgents && ctx.mode === "tui" && ctx.hasUI) {
+				const projectAgents = [...new Set(job.tasks.map((task) => task.agent))]
+					.map((name) => discovery.agents.find((agent) => agent.name === name))
+					.filter((agent): agent is AgentConfig => agent?.source === "project");
+				if (projectAgents.length > 0) {
+					const ok = await ctx.ui.confirm(
+						"Resume project-local agents?",
+						`Agents: ${projectAgents.map((agent) => boundedMetadata(agent.name)).join(", ")}\nSource: ${discovery.projectAgentsDir ? quoteExactPath(discovery.projectAgentsDir) : "(unknown)"}\n\nAgent files may have changed since this job started.`,
+					);
+					if (!ok) {
+						return {
+							content: [{ type: "text", text: `Canceled resume for ${job.id}: project-local agents were not approved.` }],
+							details: jobDetails(job),
+							isError: true,
+						};
+					}
+				}
+			}
 			const missing = job.tasks.map((task) => task.agent).filter((name) => !discovery.agents.some((agent) => agent.name === name));
 			if (missing.length > 0) {
 				return {
 					content: [{ type: "text", text: `Cannot resume ${job.id}; missing agents: ${[...new Set(missing)].join(", ")}` }],
+					details: jobDetails(job),
 					isError: true,
 				};
 			}
 
-			job.completion = runBackgroundJob(job, discovery.agents, ctx, params.instruction).catch((error) => {
-				job.status = "interrupted";
-				job.finishedAt = Date.now();
-				const pending = job.tasks.find((task) => !task.completed);
-				if (pending) pending.output = error instanceof Error ? error.message : String(error);
-				persistJob(job);
-				notifySupervisorEvent(job);
-			});
+			job.completion = runBackgroundJob(job, discovery.agents, ctx, params.instruction);
 			return {
 				content: [{
 					type: "text",

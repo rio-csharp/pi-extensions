@@ -1,0 +1,19 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "allowImportingTsExtensions": true,
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "types": ["node"]
+  },
+  "include": [
+    "extensions/compact-tool-ui/**/*.ts",
+    "extensions/relay-footer/**/*.ts",
+    "extensions/relay-providers/**/*.ts",
+    "extensions/subagent/**/*.ts",
+    "extensions/web/**/*.ts"
+  ]
+}

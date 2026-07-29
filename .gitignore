@@ -19,6 +19,12 @@ settings.json
 .env
 .env.*
 !.env.example
+.npmrc
+.netrc
+*.pem
+*.key
+id_rsa
+id_ed25519
 
 # OS/editor files
 .DS_Store

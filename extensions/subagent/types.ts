@@ -19,6 +19,7 @@ export interface SingleResult {
 	messages: Message[];
 	stderr: string;
 	usage: UsageStats;
+	provider?: string;
 	model?: string;
 	stopReason?: string;
 	errorMessage?: string;
@@ -36,6 +37,7 @@ export interface SubagentJobTaskDetails {
 	sessionId: string;
 	attempts: number;
 	completed: boolean;
+	model?: string;
 	/** Explicit supervisor state; optional for sessions persisted by older versions. */
 	state?: SubagentJobTaskState;
 }

@@ -1,0 +1,25 @@
+{
+  "name": "pi-extensions-source",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Development checks for the standalone Pi extensions in this repository",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json",
+    "test:security": "node -e \"const fs=require('node:fs'),path=require('node:path'),cp=require('node:child_process');const roots=['compact-tool-ui','relay-footer','relay-providers','subagent','web'].map(name=>path.join('extensions',name));const walk=dir=>fs.readdirSync(dir,{withFileTypes:true}).flatMap(entry=>entry.isDirectory()?walk(path.join(dir,entry.name)):[path.join(dir,entry.name)]);const files=roots.flatMap(walk).filter(file=>/\\.(?:test|spec)\\.(?:ts|[cm]?js)$/.test(file)).sort();const required=['extensions/web/security.test.ts','extensions/subagent/security.test.ts'].map(path.normalize);const missing=required.filter(file=>!files.includes(file));if(missing.length)throw new Error('Missing required security tests: '+missing.join(', '));const result=cp.spawnSync(process.execPath,['--test',...files],{stdio:'inherit'});if(result.error)throw result.error;process.exit(result.status??1)\"",
+    "test:mcp": "npm --prefix extensions/mcp test",
+    "check": "npm run typecheck && npm run test:security && npm run test:mcp",
+    "audit": "npm audit --omit=dev && npm --prefix extensions/mcp audit --omit=dev"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "0.82.1",
+    "@earendil-works/pi-ai": "0.82.1",
+    "@earendil-works/pi-coding-agent": "0.82.1",
+    "@earendil-works/pi-tui": "0.82.1",
+    "@types/node": "24.12.0",
+    "typebox": "1.3.8",
+    "typescript": "5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

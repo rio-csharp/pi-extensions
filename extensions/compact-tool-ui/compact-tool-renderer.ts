@@ -1,5 +1,20 @@
-import type { Theme, ToolRenderContext } from "@earendil-works/pi-coding-agent";
+import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
+
+interface ToolRenderContext<TState, TArgs> {
+	args: TArgs;
+	toolCallId: string;
+	invalidate: () => void;
+	lastComponent: Component | undefined;
+	state: TState;
+	cwd: string;
+	executionStarted: boolean;
+	argsComplete: boolean;
+	isPartial: boolean;
+	expanded: boolean;
+	showImages: boolean;
+	isError: boolean;
+}
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ROW_TICK_MS = 100;

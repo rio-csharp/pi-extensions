@@ -1,4 +1,4 @@
-# Subagent Example
+# Subagent Extension
 
 Delegate tasks to specialized subagents with isolated context windows.
 
@@ -9,7 +9,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Live footer status**: Running agents, their models, elapsed time, input/output/cache tokens, and cost update in the footer
 - **Parallel streaming**: Parallel task progress is collected continuously without flooding the conversation
 - **Usage tracking**: Completion lines distinguish input (`↑`), output (`↓`), cache read (`R`), and cache write (`W`) tokens
-- **Abort support**: Ctrl+C propagates to kill subagent processes
+- **Abort support**: Pi's interrupt signal propagates to terminate subagent processes
 
 ## Structure
 
@@ -21,40 +21,28 @@ subagent/
 ├── schema.ts              # Tool parameter schemas
 ├── status-publisher.ts    # Publishes live state for the active footer
 ├── timeline-renderer.ts   # Quiet start/completion rows
-├── types.ts               # Shared extension-local types
-├── agents/                # Sample agent definitions
-│   ├── scout.md         # Fast recon, returns compressed context
-│   ├── planner.md       # Creates implementation plans
-│   ├── reviewer.md      # Code review
-│   └── worker.md        # General-purpose (full capabilities)
-└── prompts/             # Workflow presets (prompt templates)
-    ├── implement.md     # scout -> planner -> worker
-    ├── scout-and-plan.md    # scout -> planner (no implementation)
-    └── implement-and-review.md  # worker -> reviewer -> worker
+└── types.ts               # Shared extension-local types
 ```
 
 ## Installation
 
-From the repository root, symlink the files:
+From this repository's root, copy the extension and provider-neutral agent definition:
+
+```powershell
+$Agent = "$HOME\.pi\agent"
+New-Item -ItemType Directory -Force "$Agent\extensions", "$Agent\agents" | Out-Null
+Copy-Item .\extensions\subagent "$Agent\extensions\" -Recurse -Force
+Copy-Item .\agents\general.md "$Agent\agents\general.md" -Force
+```
 
 ```bash
-# Symlink the extension (must be in a subdirectory with index.ts)
-mkdir -p ~/.pi/agent/extensions/subagent
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/index.ts" ~/.pi/agent/extensions/subagent/index.ts
-ln -sf "$(pwd)/packages/coding-agent/examples/extensions/subagent/agents.ts" ~/.pi/agent/extensions/subagent/agents.ts
-
-# Symlink agents
-mkdir -p ~/.pi/agent/agents
-for f in packages/coding-agent/examples/extensions/subagent/agents/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/agents/$(basename "$f")
-done
-
-# Symlink workflow prompts
-mkdir -p ~/.pi/agent/prompts
-for f in packages/coding-agent/examples/extensions/subagent/prompts/*.md; do
-  ln -sf "$(pwd)/$f" ~/.pi/agent/prompts/$(basename "$f")
-done
+AGENT="$HOME/.pi/agent"
+mkdir -p "$AGENT/extensions" "$AGENT/agents"
+cp -R extensions/subagent "$AGENT/extensions/"
+cp agents/general.md "$AGENT/agents/general.md"
 ```
+
+Run `/reload` after copying.
 
 ## Security Model
 
@@ -66,35 +54,28 @@ This tool executes a separate `pi` subprocess with a delegated system prompt and
 
 To enable project-local agents, pass `agentScope: "both"` (or `"project"`). Only do this for repositories you trust.
 
-When running interactively, the tool prompts for confirmation before running project-local agents. Set `confirmProjectAgents: false` to disable.
+Project-local agents require Pi's project-trust decision when a job is created. Persisted jobs are different: their recorded cwd can be unrelated to the current session, while Pi's extension context can report trust only for the current cwd. Therefore **every** resume of a project-scope job is refused outside TUI mode and requires an interactive confirmation that prints the exact persisted project-agent source cwd and every effective per-task child execution path in a reversible quoted form. This resume-path gate cannot be disabled. If `confirmProjectAgents` is enabled, a second confirmation names the freshly discovered project-agent files because they may have changed while the job was stopped.
 
 ## Usage
 
 ### Single agent
-```
-Use scout to find all authentication code
+```text
+Use general to inspect the authentication code
 ```
 
 ### Parallel execution
-```
-Run 2 scouts in parallel: one to find models, one to find providers
+```text
+Run two general agents in parallel: one to inspect models and one to inspect providers
 ```
 
 ### Chained workflow
-```
-Use a chain: first have scout find the read tool, then have planner suggest improvements
-```
-
-### Workflow prompts
-```
-/implement add Redis caching to the session store
-/scout-and-plan refactor auth to support OAuth
-/implement-and-review add input validation to API endpoints
+```text
+Use a chain: first have general inspect the read tool, then have general propose improvements using {previous}
 ```
 
 ## Tool Modes
 
-Background supervision is enabled by default. Starting a job returns immediately with a `jobId`; call `subagent` again whenever another independent child should be created. Use `subagent_jobs` to list, inspect, cancel, or resume jobs. Resumed work reuses the child's persisted Pi session.
+Background supervision is enabled by default. Starting a job returns immediately with a `jobId`; call `subagent` again whenever another independent child should be created. Use `subagent_jobs` to list, inspect, cancel, or resume jobs. Resumed work reuses the child's persisted Pi session and the recorded effective `provider/model` selected when that child first ran, even if the parent model or agent definition later changes. Legacy snapshots that did not record a model omit the override and let Pi restore the child session's model.
 
 | Mode | Parameter | Description |
 |------|-----------|-------------|
@@ -117,12 +98,14 @@ While work is running, the extension publishes status entries with `ctx.ui.setSt
 - Status title and agent name
 - Active model (the agent's configured model, or the inherited parent model)
 - Start time and elapsed time
-- Token usage split into input (`↑`), output (`↓`), cache read (`R`), and cache write (`W`), plus cost
+- Compact live format: `1: title · agent · provider/model · start time · elapsed · ↑input ↓output Rcache-read · cost`
 - Up to five status rows total: four individual agents plus one `… N more subagents running` summary when needed
+
+Cache-write (`W`) usage remains available in completion rows but is omitted from the live footer to preserve horizontal space.
 
 Partial output, child tool calls, final answers, and full supervisor notification bodies are not rendered in the conversation. Start and finish stay as compact one-line timeline rows even when Ctrl+O is enabled. Automatic completion, interruption, and cancellation messages render as a single count-and-elapsed-time row (for example, `✓ subagent job completed · 45/45 succeeded · 29m05s`). Their bounded full notification content still participates in the parent model's context so completion can steer or wake the main agent.
 
-`subagent_jobs` also has a dedicated compact renderer for `list`, `status`, `resume`, and `cancel`. Default `list`/`status` model results contain job metadata, aggregate succeeded/failed/pending/running counts, elapsed time, and at most five short failure diagnostics; they do not include successful task output. `list` is bounded to the 50 newest jobs. Structured tool `details` retain each returned job's complete in-memory results and child session IDs used by rendering and supervision, while the TUI always stays compact and never expands task output through Ctrl+O.
+`subagent_jobs` also has a dedicated compact renderer for `list`, `status`, `resume`, and `cancel`. Default `list`/`status` model results contain job metadata, aggregate succeeded/failed/pending/running counts, elapsed time, and at most five short failure diagnostics; they do not include successful task output. `list` is bounded to the 50 newest jobs. Structured tool `details` retain bounded result metadata and child session IDs used by rendering and supervision, while full child message arrays are omitted. The TUI always stays compact and never expands task output through Ctrl+O.
 
 For explicit diagnostics, call:
 
@@ -130,7 +113,22 @@ For explicit diagnostics, call:
 subagent_jobs { action: "status", jobId: "sub-...", includeOutput: true }
 ```
 
-This opt-in adds task output to the **model-visible** status result with hard limits of 4 KB per task and 20 KB total. The TUI row remains compact; use the model to inspect or summarize the returned diagnostics. Background supervisor notifications keep their existing 50 KB total cap, and synchronous parallel calls keep the 50 KB per-task model-output cap.
+This opt-in adds task output to the **model-visible** status result with hard limits of 4 KB per task and 20 KB total. The TUI row remains compact; use the model to inspect or summarize the returned diagnostics. Background supervisor notifications have a 50 KB total cap, and synchronous parallel calls have a 50 KB per-task model-output cap.
+
+Background persistence is append-only and delta-based: one immutable job definition is followed by small job/task state entries, rather than repeatedly embedding every prior result. This avoids quadratic session growth. Resume requires the child session id, effective model, original delegated prompt, job default cwd, and any per-task cwd, so those prompt/cwd fields are persisted **verbatim** in the parent session JSONL. Treat the parent session file as sensitive: delegated prompts can contain source, instructions, paths, or secrets. Raw prompts are omitted from structured background tool details and timeline rendering, but not from persistence because resumes explicitly restate the original task and chain templates need `{previous}` substitution. Each persisted task output is redacted on a best-effort basis and capped at 50 KB; complete in-memory output is still passed to the next step of a chain during the active run, while a chain reconstructed after restart can use only the bounded persisted handoff. Legacy full-snapshot `subagent-supervisor-job` entries remain readable.
+
+## Child Process Environment
+
+Subagents no longer inherit the parent's full environment. The child receives only:
+
+- launch/runtime and OS basics: `PATH`, `PATHEXT`, Windows system/program/profile directories, home/user/temp/shell/terminal/locale (`LC_*` included), timezone, TLS certificate paths, Node/Bun runtime settings;
+- Pi configuration: `PI_CODING_AGENT`, config/session/package directory overrides, offline/version-check/telemetry/cache/share/terminal/experimental settings;
+- networking: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`;
+- only the selected built-in provider's documented credentials/configuration (for example, an OpenAI child gets `OPENAI_API_KEY`, while a Bedrock child gets the AWS credential chain variables); provider credentials for unrelated providers are dropped;
+- for a selected custom provider, conventional names derived from its provider id (`<PROVIDER>_{API_KEY,AUTH_TOKEN,OAUTH_TOKEN,BASE_URL,ENDPOINT,ACCOUNT_ID,GATEWAY_ID,PROJECT,LOCATION,REGION}`) plus exact environment names referenced by `$NAME`/`${NAME}` in Pi's registered provider config (API key/header templates);
+- child-owned `PI_SUBAGENT_ACTIVE` and `PI_SUBAGENT_DEPTH` markers.
+
+Everything else is dropped. In particular, unrelated repository/CI/cloud/application secrets and all parent `PI_SESSION_*`, `PI_PROVIDER`, `PI_MODEL`, and `PI_REASONING_LEVEL` values are not inherited. Pi injects the child's own current session/model metadata into its bash tool at command execution time.
 
 ## Agent Definitions
 
@@ -153,35 +151,27 @@ System prompt for the agent goes here.
 
 Project agents override user agents with the same name when `agentScope: "both"`.
 
-## Sample Agents
+## Included Agent
 
-| Agent | Purpose | Model | Tools |
-|-------|---------|-------|-------|
-| `scout` | Fast codebase recon | Haiku | read, grep, find, ls, bash |
-| `planner` | Implementation plans | Sonnet | read, grep, find, ls |
-| `reviewer` | Code review | Sonnet | read, grep, find, ls, bash |
-| `worker` | General-purpose | Sonnet | (all default) |
-
-## Workflow Prompts
-
-| Prompt | Flow |
-|--------|------|
-| `/implement <query>` | scout → planner → worker |
-| `/scout-and-plan <query>` | scout → planner |
-| `/implement-and-review <query>` | worker → reviewer → worker |
+The repository ships `agents/general.md`, a provider-neutral general-purpose definition that inherits the parent Pi model and all default tools. Provider- or model-pinned definitions should remain in the user's local `~/.pi/agent/agents/` directory unless intentionally made portable.
 
 ## Error Handling
 
 - **Exit code != 0**: Tool returns error with stderr/output
 - **stopReason "error"**: LLM error propagated with error message
-- **stopReason "aborted"**: User abort (Ctrl+C) kills subprocess, throws error
+- **stopReason "aborted"**: A Pi interrupt or supervisor cancellation terminates the subprocess and returns an error
 - **Chain mode**: Stops at first failing step, reports which step failed
 
 ## Limitations
 
 - Timeline, supervisor notification, and `subagent_jobs` rows remain compact and do not reveal child output through Ctrl+O
-- Opt-in `status includeOutput` diagnostics are capped at 4 KB per task and 20 KB total
+- Persisted output, supervisor messages, status diagnostics, and background result diagnostics apply best-effort secret redaction; this is defense in depth, not a guarantee, so agents should not print credentials
+- Persisted output is capped at 50 KB per task; opt-in `status includeOutput` diagnostics are capped at 4 KB per task and 20 KB total
 - Synchronous parallel model-visible output is capped at 50 KB per task; supervisor notifications are capped at 50 KB total
+- A live chain passes the complete ephemeral output through `{previous}`; after process/session restart, only the redacted 50 KB persisted handoff is available for already completed steps
+- Shutdown waits up to 7.5 seconds for child teardown, preserves the interrupted resumable state, and rejects late writes from the retired runtime
 - Agents discovered fresh on each invocation (allows editing mid-session)
+- Project agent discovery can walk upward only to an explicitly supplied trusted project boundary; current tool/resume paths use cwd itself as that boundary because Pi exposes no arbitrary-path temporary-trust boundary. Directories and markdown files are canonicalized, and symlinks escaping the selected project-agent directory are ignored
+- Untrusted terminal controls (ANSI/OSC, C0/C1, and bidi controls) are removed from rendered title, agent, model, status, error, diagnostic, and timeline metadata
 - Parallel mode is limited to 100 tasks per call, with up to 20 concurrent processes globally across supervised jobs
 - Subagents may recursively spawn children for up to 3 child levels; agents at the third child level are leaves
