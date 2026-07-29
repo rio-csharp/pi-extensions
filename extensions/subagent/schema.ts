@@ -26,9 +26,31 @@ export const SubagentParams = Type.Object({
 	task: Type.Optional(Type.String({ description: "Task to delegate (for single mode)" })),
 	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
 	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	background: Type.Optional(
+		Type.Boolean({
+			description: "Run under the background supervisor and return immediately. Defaults to true.",
+			default: true,
+		}),
+	),
 	agentScope: Type.Optional(AgentScopeSchema),
 	confirmProjectAgents: Type.Optional(
 		Type.Boolean({ description: "Prompt before running project-local agents. Default: true.", default: true }),
 	),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process (single mode)" })),
+});
+
+export const SubagentJobsParams = Type.Object({
+	action: StringEnum(["list", "status", "resume", "cancel"] as const, {
+		description: "Supervisor action",
+	}),
+	jobId: Type.Optional(Type.String({ description: "Background job id; required except for list" })),
+	instruction: Type.Optional(
+		Type.String({ description: "Optional continuation instruction when resuming the persisted child session" }),
+	),
+	includeOutput: Type.Optional(
+		Type.Boolean({
+			description: "Opt in to bounded task output for status. Defaults to false; ignored by other actions.",
+			default: false,
+		}),
+	),
 });

@@ -6,7 +6,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 
 - **Isolated context**: Each subagent runs in a separate `pi` process
 - **Quiet timeline**: The conversation records one start line and one completion/failure line per invocation
-- **Live footer status**: Running agents, elapsed time, input/output/cache tokens, and cost update in the footer
+- **Live footer status**: Running agents, their models, elapsed time, input/output/cache tokens, and cost update in the footer
 - **Parallel streaming**: Parallel task progress is collected continuously without flooding the conversation
 - **Usage tracking**: Completion lines distinguish input (`↑`), output (`↓`), cache read (`R`), and cache write (`W`) tokens
 - **Abort support**: Ctrl+C propagates to kill subagent processes
@@ -94,11 +94,14 @@ Use a chain: first have scout find the read tool, then have planner suggest impr
 
 ## Tool Modes
 
+Background supervision is enabled by default. Starting a job returns immediately with a `jobId`; call `subagent` again whenever another independent child should be created. Use `subagent_jobs` to list, inspect, cancel, or resume jobs. Resumed work reuses the child's persisted Pi session.
+
 | Mode | Parameter | Description |
 |------|-----------|-------------|
-| Single | `{ agent, task }` | One agent, one task |
-| Parallel | `{ tasks: [...] }` | Multiple agents run concurrently (max 8, 4 concurrent) |
+| Single | `{ agent, title, task }` | Start one independent child; call again later to create another |
+| Parallel | `{ tasks: [...] }` | Batch shortcut for multiple children (max 100, 20 concurrent globally) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Synchronous compatibility | `background: false` | Wait for the invocation instead of returning a supervised job |
 
 ## Output Display
 
@@ -112,13 +115,22 @@ The conversation is intentionally quiet and acts as a timeline:
 While work is running, the extension publishes status entries with `ctx.ui.setStatus()`. The active footer (such as `relay-footer`) remains the sole footer renderer and shows the live details:
 
 - Status title and agent name
+- Active model (the agent's configured model, or the inherited parent model)
 - Start time and elapsed time
 - Token usage split into input (`↑`), output (`↓`), cache read (`R`), and cache write (`W`), plus cost
-- One row per active agent in parallel mode
+- Up to five status rows total: four individual agents plus one `… N more subagents running` summary when needed
 
-Partial output, child tool calls, and the final answer are not rendered in the conversation. They remain in the tool result sent to the parent model. Ctrl+O therefore does not expand subagent output.
+Partial output, child tool calls, final answers, and full supervisor notification bodies are not rendered in the conversation. Start and finish stay as compact one-line timeline rows even when Ctrl+O is enabled. Automatic completion, interruption, and cancellation messages render as a single count-and-elapsed-time row (for example, `✓ subagent job completed · 45/45 succeeded · 29m05s`). Their bounded full notification content still participates in the parent model's context so completion can steer or wake the main agent.
 
-For parallel calls, each completed task's model-visible output is capped at 50 KB. Full structured results remain in tool details, and failure diagnostics are returned to the parent model.
+`subagent_jobs` also has a dedicated compact renderer for `list`, `status`, `resume`, and `cancel`. Default `list`/`status` model results contain job metadata, aggregate succeeded/failed/pending/running counts, elapsed time, and at most five short failure diagnostics; they do not include successful task output. `list` is bounded to the 50 newest jobs. Structured tool `details` retain each returned job's complete in-memory results and child session IDs used by rendering and supervision, while the TUI always stays compact and never expands task output through Ctrl+O.
+
+For explicit diagnostics, call:
+
+```text
+subagent_jobs { action: "status", jobId: "sub-...", includeOutput: true }
+```
+
+This opt-in adds task output to the **model-visible** status result with hard limits of 4 KB per task and 20 KB total. The TUI row remains compact; use the model to inspect or summarize the returned diagnostics. Background supervisor notifications keep their existing 50 KB total cap, and synchronous parallel calls keep the 50 KB per-task model-output cap.
 
 ## Agent Definitions
 
@@ -167,7 +179,9 @@ Project agents override user agents with the same name when `agentScope: "both"`
 
 ## Limitations
 
-- Output truncated to last 10 items in collapsed view (expand to see all)
-- Parallel model-visible output is capped at 50 KB per task; full results remain in tool details
+- Timeline, supervisor notification, and `subagent_jobs` rows remain compact and do not reveal child output through Ctrl+O
+- Opt-in `status includeOutput` diagnostics are capped at 4 KB per task and 20 KB total
+- Synchronous parallel model-visible output is capped at 50 KB per task; supervisor notifications are capped at 50 KB total
 - Agents discovered fresh on each invocation (allows editing mid-session)
-- Parallel mode limited to 8 tasks, 4 concurrent
+- Parallel mode is limited to 100 tasks per call, with up to 20 concurrent processes globally across supervised jobs
+- Subagents may recursively spawn children for up to 3 child levels; agents at the third child level are leaves

@@ -2,13 +2,16 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import type { SingleResult, UsageStats } from "./types.ts";
 
 const STATUS_KEY_PREFIX = "subagent-status-";
+const STATUS_SUMMARY_KEY = `${STATUS_KEY_PREFIX}summary`;
 const STATUS_TICK_MS = 1000;
+const MAX_STATUS_ROWS = 5;
 
 interface RunningSubagent {
 	agent: string;
 	title: string;
 	startedAt: number;
 	usage: UsageStats;
+	model?: string;
 }
 
 function statusKey(runId: number): string {
@@ -49,16 +52,41 @@ export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 	let nextRunId = 0;
 	let statusTimer: ReturnType<typeof setInterval> | undefined;
 	const runningSubagents = new Map<number, RunningSubagent>();
+	const publishedStatusKeys = new Set<string>();
 
 	const publishStatuses = (ctx: ExtensionContext) => {
-		const multiple = runningSubagents.size > 1;
-		for (const [index, [runId, running]] of Array.from(runningSubagents.entries()).entries()) {
+		const entries = Array.from(runningSubagents.entries());
+		const visibleCount = entries.length <= MAX_STATUS_ROWS ? entries.length : MAX_STATUS_ROWS - 1;
+		const visibleEntries = entries.slice(0, visibleCount);
+		const hiddenCount = entries.length - visibleEntries.length;
+		const desiredKeys = new Set<string>();
+		const multiple = entries.length > 1;
+
+		for (const [index, [runId, running]] of visibleEntries.entries()) {
+			const key = statusKey(runId);
+			desiredKeys.add(key);
 			const usage = running.usage;
 			const tokenStats = `↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} R${formatTokens(usage.cacheRead)} W${formatTokens(usage.cacheWrite)}`;
 			const prefix = multiple ? `subagent ${index + 1}` : "subagent";
-			const text = `${prefix}: ${running.title} (${running.agent}) [start ${formatStartTime(running.startedAt)} · ${formatElapsed(running.startedAt)} · ${tokenStats} · $${usage.cost.toFixed(4)}]`;
-			ctx.ui.setStatus(statusKey(runId), ctx.ui.theme.fg("accent", text));
+			const model = running.model ? `model ${running.model} · ` : "";
+			const text = `${prefix}: ${running.title} (${running.agent}) [${model}start ${formatStartTime(running.startedAt)} · ${formatElapsed(running.startedAt)} · ${tokenStats} · $${usage.cost.toFixed(4)}]`;
+			ctx.ui.setStatus(key, ctx.ui.theme.fg("accent", text));
 		}
+
+		if (hiddenCount > 0) {
+			desiredKeys.add(STATUS_SUMMARY_KEY);
+			const noun = hiddenCount === 1 ? "subagent" : "subagents";
+			ctx.ui.setStatus(
+				STATUS_SUMMARY_KEY,
+				ctx.ui.theme.fg("dim", `… ${hiddenCount} more ${noun} running`),
+			);
+		}
+
+		for (const key of publishedStatusKeys) {
+			if (!desiredKeys.has(key)) ctx.ui.setStatus(key, undefined);
+		}
+		publishedStatusKeys.clear();
+		for (const key of desiredKeys) publishedStatusKeys.add(key);
 	};
 
 	const stopTimerIfIdle = () => {
@@ -72,12 +100,14 @@ export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 		title: string | undefined,
 		ctx: ExtensionContext,
 		run: (onStatusUpdate: (result: SingleResult) => void) => Promise<T>,
+		model?: string,
 	): Promise<T> => {
 		const runId = nextRunId++;
 		runningSubagents.set(runId, {
 			agent: agentName,
 			title: title?.trim() || agentName,
 			startedAt: Date.now(),
+			model: model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		});
 		publishStatuses(ctx);
@@ -88,6 +118,7 @@ export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 			const running = runningSubagents.get(runId);
 			if (!running) return;
 			running.usage = { ...result.usage };
+			running.model = result.model ?? running.model;
 			publishStatuses(ctx);
 		};
 
@@ -96,16 +127,16 @@ export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 		} finally {
 			runningSubagents.delete(runId);
 			ctx.ui.setStatus(statusKey(runId), undefined);
-			// Renumber labels such as "subagent 1" after a parallel task exits.
+			publishedStatusKeys.delete(statusKey(runId));
+			// Renumber visible labels and promote the next hidden subagent.
 			publishStatuses(ctx);
 			stopTimerIfIdle();
 		}
 	};
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		for (const runId of runningSubagents.keys()) {
-			ctx.ui.setStatus(statusKey(runId), undefined);
-		}
+		for (const key of publishedStatusKeys) ctx.ui.setStatus(key, undefined);
+		publishedStatusKeys.clear();
 		runningSubagents.clear();
 		if (statusTimer) clearInterval(statusTimer);
 		statusTimer = undefined;

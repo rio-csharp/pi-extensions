@@ -1,7 +1,15 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Theme, ToolRenderContext } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
-import type { SingleResult, SubagentDetails, SubagentTimelineState, UsageStats } from "./types.ts";
+import type {
+	BackgroundJobStatus,
+	SingleResult,
+	SubagentDetails,
+	SubagentJobsDetails,
+	SubagentJobsRenderState,
+	SubagentTimelineState,
+	UsageStats,
+} from "./types.ts";
 
 interface TimelineRenderContext {
 	args: SubagentArgs;
@@ -14,6 +22,7 @@ interface SubagentArgs {
 	agent?: string;
 	title?: string;
 	task?: string;
+	background?: boolean;
 	agentScope?: AgentScope;
 	tasks?: Array<{ agent: string; title: string; task: string }>;
 	chain?: Array<{ agent: string; title: string; task: string }>;
@@ -38,10 +47,20 @@ function formatClock(timestamp: number): string {
 
 function formatElapsed(milliseconds: number): string {
 	if (milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))}ms`;
-	const seconds = milliseconds / 1000;
-	if (seconds < 60) return `${seconds.toFixed(1)}s`;
-	const minutes = Math.floor(seconds / 60);
-	return `${minutes}m${Math.floor(seconds % 60).toString().padStart(2, "0")}s`;
+	const totalSeconds = Math.floor(milliseconds / 1000);
+	if (totalSeconds < 60) return `${totalSeconds}s`;
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}h${minutes.toString().padStart(2, "0")}m${seconds.toString().padStart(2, "0")}s`;
+	return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
+}
+
+function shortJobId(jobId: string | undefined): string {
+	if (!jobId) return "unknown";
+	const prefix = jobId.startsWith("sub-") ? "sub-" : "";
+	const body = prefix ? jobId.slice(prefix.length) : jobId;
+	return body.length > 8 ? `${prefix}${body.slice(0, 8)}` : jobId;
 }
 
 function formatTokens(count: number): string {
@@ -118,6 +137,9 @@ function getTextResult(result: any): string {
 }
 
 function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined): string {
+	if (details?.background && details.jobId) {
+		return `background · ${details.jobStatus ?? "running"} · ${details.jobId}`;
+	}
 	if (!details?.results.length) return describeStart(args);
 	const failed = details.results.filter(isFailedResult).length;
 	const succeeded = details.results.length - failed;
@@ -137,12 +159,14 @@ function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined
 function classifyOutcome(
 	result: any,
 	context: TimelineRenderContext,
-): "completed" | "failed" | "canceled" {
+): "running" | "completed" | "failed" | "canceled" {
 	const details = result.details as SubagentDetails | undefined;
 	const text = getTextResult(result);
-	if (/^Canceled:/i.test(text)) return "canceled";
+	if (details?.background && (details.jobStatus === "running" || details.jobStatus === "canceling")) return "running";
+	if (/^Canceled:/i.test(text) || details?.jobStatus === "canceled") return "canceled";
 	if (context.isError || details?.results.some(isFailedResult)) return "failed";
-	if (/^(Invalid parameters|Too many parallel tasks|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
+	if (details?.jobStatus === "failed" || details?.jobStatus === "interrupted") return "failed";
+	if (/^(Invalid parameters|Too many (parallel|background) tasks|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
 	return "completed";
 }
 
@@ -173,15 +197,19 @@ export const subagentTimelineRenderer = {
 	) {
 		if (options.isPartial) return context.lastComponent ?? new EmptyComponent();
 
+		const details = result.details as SubagentDetails | undefined;
+		// Background execution has its own completion timeline message. Keep only
+		// the original "subagent started" row when the start tool returns.
+		if (details?.background) return context.lastComponent ?? new EmptyComponent();
+
 		const state = context.state;
 		state.startedAt ??= Date.now();
 		state.finishedAt ??= Date.now();
 		const outcome = classifyOutcome(result, context);
-		const color = outcome === "completed" ? "success" : outcome === "failed" ? "error" : "warning";
-		const icon = outcome === "completed" ? "✓" : outcome === "failed" ? "✗" : "○";
+		const color = outcome === "completed" ? "success" : outcome === "failed" ? "error" : outcome === "running" ? "accent" : "warning";
+		const icon = outcome === "completed" ? "✓" : outcome === "failed" ? "✗" : outcome === "running" ? "↗" : "○";
 		const timestamp = theme.fg("dim", `[${formatClock(state.finishedAt)}]`);
 		const label = theme.fg("toolTitle", theme.bold(`subagent ${outcome}`));
-		const details = result.details as SubagentDetails | undefined;
 		const summary = describeFinish(context.args, details);
 		const elapsed = formatElapsed(state.finishedAt - state.startedAt);
 		const usage = details?.results.length ? formatUsage(details.results) : "";
@@ -192,3 +220,173 @@ export const subagentTimelineRenderer = {
 		return state.resultText;
 	},
 };
+
+function supervisorVisual(status: BackgroundJobStatus | undefined): {
+	label: string;
+	icon: string;
+	color: "success" | "error" | "warning" | "accent";
+} {
+	switch (status) {
+		case "completed":
+			return { label: "completed", icon: "✓", color: "success" };
+		case "canceled":
+			return { label: "canceled", icon: "○", color: "warning" };
+		case "running":
+		case "canceling":
+			return { label: status, icon: "↗", color: "accent" };
+		case "failed":
+		case "interrupted":
+		default:
+			return { label: status ?? "failed", icon: "✗", color: "error" };
+	}
+}
+
+function taskCounts(details: SubagentDetails | undefined): {
+	total: number;
+	succeeded: number;
+	failed: number;
+	pending: number;
+	running: number;
+} {
+	if (details?.tasks) {
+		return details.tasks.reduce(
+			(counts, task) => {
+				counts[task.state ?? (task.completed ? "succeeded" : "pending")]++;
+				return counts;
+			},
+			{ total: details.tasks.length, succeeded: 0, failed: 0, pending: 0, running: 0 },
+		);
+	}
+	const results = details?.results ?? [];
+	const failed = results.filter(isFailedResult).length;
+	return { total: results.length, succeeded: results.length - failed, failed, pending: 0, running: 0 };
+}
+
+function formatTaskCounts(details: SubagentDetails | undefined): string {
+	const counts = taskCounts(details);
+	return `${counts.succeeded} succeeded · ${counts.failed} failed · ${counts.pending} pending · ${counts.running} running`;
+}
+
+/** Render supervisor notifications as one compact row, regardless of Ctrl+O. */
+export function renderSubagentSupervisorMessage(message: any, theme: Theme): Component {
+	const details = message.details as SubagentDetails | undefined;
+	const finishedAt = details?.finishedAt ?? Date.now();
+	const startedAt = details?.startedAt ?? finishedAt;
+	const visual = supervisorVisual(details?.jobStatus);
+	const timestamp = theme.fg("dim", `[${formatClock(finishedAt)}]`);
+	const label = theme.fg("toolTitle", theme.bold(`subagent job ${visual.label}`));
+	const counts = taskCounts(details);
+	const countSummary = counts.failed === 0 && counts.pending === 0 && counts.running === 0
+		? `${counts.succeeded}/${counts.total} succeeded`
+		: `${counts.succeeded}/${counts.total} succeeded · ${counts.failed} failed · ${counts.pending} pending · ${counts.running} running`;
+	const elapsed = formatElapsed(Math.max(0, finishedAt - startedAt));
+	const content = `${timestamp} ${theme.fg(visual.color, visual.icon)} ${label} · ${countSummary} · ${elapsed}`;
+	return new Text(content, 0, 0);
+}
+
+interface SubagentJobsArgs {
+	action?: "list" | "status" | "resume" | "cancel";
+	jobId?: string;
+	includeOutput?: boolean;
+}
+
+function jobsDetails(result: any): SubagentDetails[] {
+	const details = resultDetails(result);
+	if (!details) return [];
+	return "jobs" in details ? details.jobs : [details];
+}
+
+function resultDetails(
+	result: any,
+): SubagentDetails | SubagentJobsDetails | undefined {
+	const details = result?.details;
+	if (!details || typeof details !== "object") return undefined;
+	if ("jobs" in details && Array.isArray(details.jobs)) return details as SubagentJobsDetails;
+	if ("mode" in details && Array.isArray(details.results)) return details as SubagentDetails;
+	return undefined;
+}
+
+function describeJobsResult(args: SubagentJobsArgs, result: any, isError: boolean): string {
+	const jobs = jobsDetails(result);
+	if (args.action === "list") {
+		const statuses = new Map<BackgroundJobStatus, number>();
+		for (const job of jobs) {
+			if (job.jobStatus) statuses.set(job.jobStatus, (statuses.get(job.jobStatus) ?? 0) + 1);
+		}
+		const summary = [...statuses.entries()].map(([status, count]) => `${count} ${status}`).join(" · ");
+		return `${jobs.length} job${jobs.length === 1 ? "" : "s"}${summary ? ` · ${summary}` : ""}`;
+	}
+
+	const details = jobs[0];
+	if (!details) {
+		const text = compactTitle(getTextResult(result), isError ? "failed" : "done");
+		return `${shortJobId(args.jobId)} · ${text}`;
+	}
+	const elapsed = formatElapsed(Math.max(0, (details.finishedAt ?? Date.now()) - (details.startedAt ?? Date.now())));
+	return `${shortJobId(details.jobId ?? args.jobId)} · ${details.jobStatus ?? (isError ? "failed" : "completed")} · ${formatTaskCounts(details)} · ${elapsed}`;
+}
+
+function updateJobsCall(
+	args: SubagentJobsArgs,
+	theme: Theme,
+	context: ToolRenderContext<SubagentJobsRenderState, SubagentJobsArgs>,
+): Text {
+	const state = context.state;
+	state.calledAt ??= Date.now();
+	const settled = state.resultDetails !== undefined;
+	const failed = context.isError || state.isError;
+	const icon = !context.executionStarted
+		? theme.fg("dim", "○")
+		: !settled
+			? theme.fg("accent", "↗")
+			: failed
+				? theme.fg("error", "✗")
+				: theme.fg("success", "✓");
+	const action = args.action ?? "unknown";
+	const invocation = action === "list"
+		? "list"
+		: `${action} · ${shortJobId(args.jobId)}${action === "status" && args.includeOutput ? " · output requested" : ""}`;
+	const summary = settled
+		? describeJobsResult(args, { details: state.resultDetails }, Boolean(failed))
+		: invocation;
+	const timestamp = theme.fg("dim", `[${formatClock(state.calledAt)}]`);
+	const label = theme.fg("toolTitle", theme.bold("subagent_jobs"));
+	state.callText ??= context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+	state.callText.setText(`${timestamp} ${icon} ${label} · ${summary}`);
+	return state.callText;
+}
+
+/** Compact call/result renderer; Ctrl+O never reveals task output. */
+export const subagentJobsRenderer = {
+	renderShell: "self" as const,
+
+	renderCall(
+		args: SubagentJobsArgs,
+		theme: Theme,
+		context: ToolRenderContext<SubagentJobsRenderState, SubagentJobsArgs>,
+	): Component {
+		return updateJobsCall(args, theme, context);
+	},
+
+	renderResult(
+		result: any,
+		options: { isPartial: boolean },
+		theme: Theme,
+		context: ToolRenderContext<SubagentJobsRenderState, SubagentJobsArgs>,
+	): Component {
+		if (options.isPartial) return context.lastComponent ?? new EmptyComponent();
+		const details = resultDetails(result);
+		stateFromResult(context.state, details, context.isError);
+		updateJobsCall(context.args, theme, context);
+		return context.lastComponent ?? new EmptyComponent();
+	},
+};
+
+function stateFromResult(
+	state: SubagentJobsRenderState,
+	details: SubagentDetails | SubagentJobsDetails | undefined,
+	isError: boolean,
+): void {
+	state.resultDetails = details && "jobs" in details ? details : { jobs: details ? [details] : [] };
+	state.isError = isError;
+}

@@ -25,11 +25,36 @@ export interface SingleResult {
 	step?: number;
 }
 
+export type SubagentMode = "single" | "parallel" | "chain";
+export type BackgroundJobStatus = "running" | "canceling" | "completed" | "failed" | "interrupted" | "canceled";
+
+export type SubagentJobTaskState = "succeeded" | "failed" | "pending" | "running";
+
+export interface SubagentJobTaskDetails {
+	agent: string;
+	title: string;
+	sessionId: string;
+	attempts: number;
+	completed: boolean;
+	/** Explicit supervisor state; optional for sessions persisted by older versions. */
+	state?: SubagentJobTaskState;
+}
+
 export interface SubagentDetails {
-	mode: "single" | "parallel" | "chain";
+	mode: SubagentMode;
 	agentScope: AgentScope;
 	projectAgentsDir: string | null;
 	results: SingleResult[];
+	background?: boolean;
+	jobId?: string;
+	jobStatus?: BackgroundJobStatus;
+	startedAt?: number;
+	finishedAt?: number;
+	tasks?: SubagentJobTaskDetails[];
+}
+
+export interface SubagentJobsDetails {
+	jobs: SubagentDetails[];
 }
 
 export interface SubagentTimelineState {
@@ -37,4 +62,11 @@ export interface SubagentTimelineState {
 	finishedAt?: number;
 	startText?: import("@earendil-works/pi-tui").Text;
 	resultText?: import("@earendil-works/pi-tui").Text;
+}
+
+export interface SubagentJobsRenderState {
+	calledAt?: number;
+	callText?: import("@earendil-works/pi-tui").Text;
+	resultDetails?: SubagentJobsDetails;
+	isError?: boolean;
 }
