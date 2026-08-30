@@ -8,6 +8,7 @@ import {
 	createFindToolDefinition,
 	createGrepToolDefinition,
 	createLsToolDefinition,
+	createPowerShellToolDefinition,
 	createReadToolDefinition,
 	createWriteToolDefinition,
 	type ExtensionAPI,
@@ -20,7 +21,7 @@ import {
 	type CompactRenderState,
 } from "./compact-tool-renderer.ts";
 
-const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
+const TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"] as const;
 type ToolName = (typeof TOOL_NAMES)[number];
 type AnyDefinition = ToolDefinition<any, any, CompactRenderState>;
 
@@ -79,6 +80,8 @@ function createDefinition(name: ToolName, cwd: string, settings: ToolSettings): 
 				shellPath: settings.shellPath,
 				commandPrefix: settings.shellCommandPrefix,
 			}) as AnyDefinition;
+		case "powershell":
+			return createPowerShellToolDefinition(cwd) as AnyDefinition;
 		case "edit":
 			return createEditToolDefinition(cwd) as AnyDefinition;
 		case "write":
@@ -105,7 +108,8 @@ function quote(value: unknown): string {
 function formatInvocation(name: ToolName, args: Record<string, any>, theme: Theme): string {
 	switch (name) {
 		case "bash":
-			// Deliberately preserve the complete command and its original newlines.
+		case "powershell":
+			// Preserve command text for the shared renderer, which caps only its display.
 			return typeof args.command === "string" && args.command.length > 0 ? args.command : "...";
 
 		case "read": {
@@ -162,9 +166,11 @@ function getTextResult(result: any): string {
 	return typeof block?.text === "string" ? block.text : "";
 }
 
-function countOutputLines(text: string): number {
+export function countOutputLines(text: string): number {
 	if (!text) return 0;
-	return text.replace(/\r\n/g, "\n").split("\n").length;
+	const normalized = text.replace(/\r\n|\r/g, "\n");
+	const lineCount = normalized.split("\n").length;
+	return normalized.endsWith("\n") ? lineCount - 1 : lineCount;
 }
 
 export function registerCompactBuiltInTools(pi: ExtensionAPI): void {
@@ -176,7 +182,7 @@ export function registerCompactBuiltInTools(pi: ExtensionAPI): void {
 		const renderer = createCompactRenderer(
 			name,
 			(args, theme) => formatInvocation(name, args, theme),
-			name === "bash"
+			name === "bash" || name === "powershell"
 				? {
 						observeResult(result, options, state) {
 							if (options.isPartial) state.outputLines = countOutputLines(getTextResult(result));

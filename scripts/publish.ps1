@@ -78,54 +78,6 @@ function Get-IndexBlobText {
     return (@(Get-GitOutput show ":$Path") -join "`n")
 }
 
-function Test-AcknowledgedRootDevAudit {
-    # @earendil-works/pi-coding-agent 0.82.1 ships an npm-shrinkwrap.json that pins
-    # this transitive development-only package. npm overrides cannot supersede a
-    # dependency's published shrinkwrap, so permit only this exact finding.
-    $previousErrorActionPreference = $ErrorActionPreference
-    try {
-        $ErrorActionPreference = "Continue"
-        $auditText = (& npm audit --json 2>&1 | Out-String)
-        $auditExitCode = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previousErrorActionPreference
-    }
-    if ($auditExitCode -eq 0) {
-        Write-Host "Root full-tree audit is clean." -ForegroundColor Green
-        return
-    }
-
-    try {
-        $report = $auditText | ConvertFrom-Json
-    } catch {
-        throw "Root full-tree npm audit failed and did not return valid JSON: $auditText"
-    }
-
-    $names = @($report.vulnerabilities.PSObject.Properties.Name)
-    $finding = $report.vulnerabilities.'brace-expansion'
-    $nodes = @($finding.nodes)
-    $advisorySources = @($finding.via | ForEach-Object { $_.source })
-    $expectedNode = "node_modules/@earendil-works/pi-coding-agent/node_modules/brace-expansion"
-
-    $isExactAcknowledgement =
-        $names.Count -eq 1 -and
-        $names[0] -eq "brace-expansion" -and
-        $finding.severity -eq "high" -and
-        $finding.isDirect -eq $false -and
-        $nodes.Count -eq 1 -and
-        $nodes[0] -eq $expectedNode -and
-        $advisorySources.Count -eq 1 -and
-        $advisorySources[0] -eq 1124334 -and
-        $report.metadata.vulnerabilities.total -eq 1 -and
-        $report.metadata.vulnerabilities.high -eq 1
-
-    if (-not $isExactAcknowledgement) {
-        throw "Root full-tree npm audit contains an unacknowledged finding: $auditText"
-    }
-
-    Write-Warning "Acknowledged dev-only upstream finding: GHSA-mh99-v99m-4gvg in $expectedNode. Production audits remain clean; update Pi when upstream publishes a corrected shrinkwrap."
-}
-
 try {
     if ($repo -match '(?i)(^|[\\/])k12-general([\\/]|$)' -or $Message -match '(?i)\bk12-general\b') {
         throw "Refusing to publish anything associated with private k12-general material."
@@ -173,7 +125,7 @@ try {
     Invoke-Npm --prefix extensions/mcp ci --ignore-scripts
     Invoke-Npm run check
     Invoke-Npm run audit
-    Test-AcknowledgedRootDevAudit
+    Invoke-Npm audit
     Invoke-Npm --prefix extensions/mcp audit
 
     Write-Host "Working-tree paths proposed for staging:" -ForegroundColor Cyan

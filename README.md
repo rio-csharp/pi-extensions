@@ -10,9 +10,9 @@ These extensions target the `@earendil-works/pi-*` packages published from that 
 
 ### `compact-tool-ui`
 
-Compact timestamped rendering for built-in tools. Tool results stay hidden and running calls show a spinner, elapsed time, and bash output-line counts.
+Compact timestamped rendering for built-in tools. Invocation rows are capped at three display lines, tool results stay hidden, and running calls show a spinner, elapsed time, and shell output-line counts.
 
-This extension overrides the built-in tool definitions for `read`, `bash`, `edit`, `write`, `grep`, `find`, and `ls` only for rendering/execution delegation. It does not replace the underlying tool behavior.
+This extension overrides the built-in tool definitions for `read`, `bash`, `powershell`, `edit`, `write`, `grep`, `find`, and `ls` only for rendering/execution delegation. It does not replace the underlying tool behavior.
 
 ### `web`
 
@@ -25,7 +25,7 @@ The web tools apply destination and transfer-size safeguards. Search queries and
 
 ### `subagent`
 
-Runs specialized subagents in isolated Pi subprocesses with background supervision enabled by default. A call returns a job ID immediately; completion or interruption is delivered automatically, and `subagent_jobs` can list, inspect, cancel, or resume persisted child sessions. Synchronous execution remains available with `background: false`.
+Runs specialized subagents in isolated Pi subprocesses with background supervision enabled by default. A call returns a job ID immediately; completion or interruption is delivered automatically, and `subagent_jobs` can steer running children or list, inspect, cancel, and resume persisted child sessions. Synchronous execution remains available with `background: false`.
 
 Live progress is published through `setStatus()` and includes the agent name, active model, elapsed time, token usage, and cost. The extension does not call `setFooter()`, remains compatible with `relay-footer`, and uses the `subagent-status-*` status-key prefix. See [`extensions/subagent/README.md`](./extensions/subagent/README.md) for modes, limits, and security details.
 
@@ -49,7 +49,7 @@ Private extensions and provider- or model-pinned agent definitions are intention
 
 ## Requirements
 
-- Pi coding agent `0.82.1` or a compatible newer release
+- Pi coding agent `0.84.4` or a compatible newer release
 - Node.js `22.19.0` or newer
 - `curl` on `PATH` when using the `web` extension
 - `npm` when installing the MCP extension
@@ -126,7 +126,7 @@ npm audit
 npm --prefix extensions/mcp audit
 ```
 
-`npm run audit` is the release gate and audits production dependencies at both levels; it must stay clean. The two full-tree commands also report development dependencies. At root, `npm audit` currently reports one acknowledged high-severity, development-only `brace-expansion` advisory ([GHSA-mh99-v99m-4gvg](https://github.com/advisories/GHSA-mh99-v99m-4gvg)) under `@earendil-works/pi-coding-agent@0.82.1`. That published package's bundled `npm-shrinkwrap.json` pins version `5.0.7`, so a consumer override cannot safely replace it; do not hand-edit the lockfile. The publish script allows only that exact advisory/node combination and fails on any additional or changed full-tree finding. Update the Pi packages and remove the exception when upstream publishes a corrected shrinkwrap. The standalone MCP full-tree audit is expected to be clean.
+`npm run audit` is the release gate and audits production dependencies at both levels; it must stay clean. The two full-tree commands also report development dependencies and are expected to stay clean.
 
 ## Development setup with junctions
 

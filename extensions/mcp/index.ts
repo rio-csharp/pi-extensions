@@ -1610,7 +1610,7 @@ export default function mcpExtension(pi: ExtensionAPI) {
       ctx.ui.notify(
         server.bearerTokenEnv
           ? `Bearer credentials are read from ${server.bearerTokenEnv}. Set it in Pi's environment, then run /mcp connect ${safeServerName(server)}.`
-          : "Pi 0.82.1 exposes no supported masked secret input to ordinary extensions. Re-add this server with --bearer-token-env <ENV_VAR>; ordinary ui.input is intentionally not used.",
+          : "Pi exposes no supported masked secret input to ordinary extensions. Re-add this server with --bearer-token-env <ENV_VAR>; ordinary ui.input is intentionally not used.",
         "warning",
       );
       return;

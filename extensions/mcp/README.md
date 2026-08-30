@@ -88,7 +88,7 @@ Options:
 - `--bearer-token-env <ENV_VAR>` — read a bearer token from this environment variable at connection time.
 - `--oauth-scope <scope>` — request an explicit OAuth scope (OAuth servers only).
 
-Bearer tokens are intentionally rejected in command text and are not requested with `ctx.ui.input`. Pi 0.82.1's ordinary extension UI exposes only unmasked `input`. Although the separate model-provider auth contract accepts a `type: "secret"` hint, Pi 0.82.1's TUI routes that hint to the normal `Input` component and even replaces it with the submitted plaintext afterward; it is not a supported masked input facility for this extension. Configure bearer servers with an environment-variable reference instead.
+Bearer tokens are intentionally rejected in command text and are not requested with `ctx.ui.input`. Pi's ordinary extension UI exposes only unmasked `input`; the separate model-provider auth contract's `type: "secret"` hint is not a supported masked input facility for this extension. Configure bearer servers with an environment-variable reference instead.
 
 Examples:
 

@@ -302,8 +302,9 @@ export function renderSubagentSupervisorMessage(message: any, theme: Theme): Com
 }
 
 interface SubagentJobsArgs {
-	action?: "list" | "status" | "resume" | "cancel";
+	action?: "list" | "status" | "steer" | "resume" | "cancel";
 	jobId?: string;
+	taskIndex?: number;
 	includeOutput?: boolean;
 }
 
@@ -362,7 +363,7 @@ function updateJobsCall(
 	const action = terminalSanitize(String(args.action ?? "unknown"));
 	const invocation = action === "list"
 		? "list"
-		: `${action} · ${shortJobId(args.jobId)}${action === "status" && args.includeOutput ? " · output requested" : ""}`;
+		: `${action} · ${shortJobId(args.jobId)}${action === "steer" && args.taskIndex !== undefined ? ` · task ${args.taskIndex}` : ""}${action === "status" && args.includeOutput ? " · output requested" : ""}`;
 	const summary = settled
 		? describeJobsResult(args, { details: state.resultDetails }, Boolean(failed))
 		: invocation;

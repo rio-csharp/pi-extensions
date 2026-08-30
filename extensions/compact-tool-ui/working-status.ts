@@ -71,6 +71,10 @@ export function registerWorkingStatus(pi: ExtensionAPI): void {
 		updateMessage();
 	});
 
+	pi.on("context", (_event, ctx) => {
+		setStage("Preparing conversation context", ctx);
+	});
+
 	pi.on("before_provider_request", (_event, ctx) => {
 		setStage("Requesting model", ctx);
 	});
@@ -81,15 +85,34 @@ export function registerWorkingStatus(pi: ExtensionAPI): void {
 
 	pi.on("message_update", (event, ctx) => {
 		if (event.message.role !== "assistant") return;
-		const toolCalls = event.message.content.filter((item: any) => item?.type === "toolCall");
-		if (toolCalls.length > 0) {
-			const names = [...new Set(toolCalls.map((item: any) => item.name).filter(Boolean))];
-			setStage(`Preparing tool call${names.length ? `: ${names.join(", ")}` : ""}`, ctx);
-			return;
-		}
 
-		const streamType = (event.assistantMessageEvent as any)?.type as string | undefined;
-		setStage(streamType?.includes("thinking") ? "Generating reasoning" : "Generating response", ctx);
+		switch (event.assistantMessageEvent.type) {
+			case "thinking_start":
+			case "thinking_delta":
+			case "thinking_end":
+				setStage("Generating reasoning", ctx);
+				break;
+
+			case "text_start":
+			case "text_delta":
+			case "text_end":
+				setStage("Generating response", ctx);
+				break;
+
+			case "toolcall_start":
+			case "toolcall_delta":
+			case "toolcall_end": {
+				const names = [
+					...new Set(
+						event.message.content.flatMap((item) =>
+							item.type === "toolCall" && item.name ? [item.name] : [],
+						),
+					),
+				];
+				setStage(`Preparing tool call${names.length ? `: ${names.join(", ")}` : ""}`, ctx);
+				break;
+			}
+		}
 	});
 
 	pi.on("tool_execution_start", (event, ctx) => {

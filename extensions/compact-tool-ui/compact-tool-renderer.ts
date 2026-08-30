@@ -1,6 +1,13 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
-import { Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
+import {
+	truncateToWidth,
+	visibleWidth,
+	wrapTextWithAnsi,
+	type Component,
+} from "@earendil-works/pi-tui";
 
+// Local structural subset of Pi's tool-render context. Keep it synchronized
+// with the Pi version supported by this extension.
 interface ToolRenderContext<TState, TArgs> {
 	args: TArgs;
 	toolCallId: string;
@@ -24,7 +31,7 @@ export interface CompactRenderState {
 	startedAt?: number;
 	finishedAt?: number;
 	outputLines?: number;
-	callText?: Text;
+	callComponent?: CompactInvocationComponent;
 }
 
 export interface CompactRendererOptions {
@@ -57,6 +64,80 @@ class EmptyComponent implements Component {
 	}
 
 	invalidate(): void {}
+}
+
+const MAX_INVOCATION_LINES = 3;
+const ELLIPSIS = "...";
+
+function normalizeInvocation(invocation: string): string {
+	const normalized = invocation.replace(/\r\n|\r/g, "\n");
+	// String splitting creates one terminal empty artifact for a trailing newline.
+	// Remove only that artifact; any preceding empty line remains meaningful.
+	return normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
+}
+
+function layoutInvocation(prefix: string, invocation: string): {
+	text: string;
+	continuationIndent: number;
+} {
+	const lines = normalizeInvocation(invocation).split("\n");
+	const continuationIndent = visibleWidth(prefix) + 3;
+	const indent = " ".repeat(continuationIndent);
+	return {
+		text: `${prefix} · ${lines[0] ?? ""}${lines.slice(1).map((line) => `\n${indent}${line}`).join("")}`,
+		continuationIndent,
+	};
+}
+
+function capInvocationLines(
+	wrappedLines: string[],
+	continuationIndent: number,
+	width: number,
+): string[] {
+	if (wrappedLines.length <= MAX_INVOCATION_LINES) return wrappedLines;
+
+	const ellipsis = truncateToWidth(ELLIPSIS, width, "");
+	const maxIndent = Math.max(0, width - visibleWidth(ellipsis));
+	const indent = " ".repeat(Math.min(continuationIndent, maxIndent));
+
+	return [
+		...wrappedLines.slice(0, MAX_INVOCATION_LINES - 1),
+		`${indent}${ellipsis}`,
+	];
+}
+
+/** Width-aware invocation row capped after ANSI-safe wrapping. */
+export class CompactInvocationComponent implements Component {
+	private prefix = "";
+	private invocation = "";
+	private cachedWidth?: number;
+	private cachedLines?: string[];
+
+	setContent(prefix: string, invocation: string): void {
+		if (prefix === this.prefix && invocation === this.invocation) return;
+		this.prefix = prefix;
+		this.invocation = invocation;
+		this.invalidate();
+	}
+
+	render(width: number): string[] {
+		const renderWidth = Math.max(1, Math.floor(width));
+		if (this.cachedLines && this.cachedWidth === renderWidth) return this.cachedLines;
+
+		const { text, continuationIndent } = layoutInvocation(this.prefix, this.invocation);
+		// Match Text's tab display while taking control of its post-wrap line count.
+		const wrapped = wrapTextWithAnsi(text.replace(/\t/g, "   "), renderWidth);
+		const lines = capInvocationLines(wrapped, continuationIndent, renderWidth);
+
+		this.cachedWidth = renderWidth;
+		this.cachedLines = lines;
+		return lines;
+	}
+
+	invalidate(): void {
+		this.cachedWidth = undefined;
+		this.cachedLines = undefined;
+	}
 }
 
 function formatClock(timestamp: number): string {
@@ -105,7 +186,7 @@ export function createCompactRenderer(
 		args: Record<string, any>,
 		theme: Theme,
 		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
-	): Text => {
+	): CompactInvocationComponent => {
 		const state = context.state;
 		const now = Date.now();
 		state.calledAt ??= now;
@@ -146,22 +227,14 @@ export function createCompactRenderer(
 		const prefix = `${timestamp} ${icon} ${toolName}${status}`;
 		const invocation = formatInvocation(args, theme);
 
-		let output: string;
-		if (invocation.includes("\n")) {
-			const lines = invocation.split("\n");
-			const indent = " ".repeat(visibleWidth(prefix) + 3);
-			output = `${prefix} · ${lines[0] ?? ""}`;
-			for (const line of lines.slice(1)) output += `\n${indent}${line}`;
-		} else {
-			output = `${prefix} · ${invocation}`;
+		let component = state.callComponent;
+		if (!component && context.lastComponent instanceof CompactInvocationComponent) {
+			component = context.lastComponent;
 		}
-
-		let text = state.callText;
-		if (!text && context.lastComponent instanceof Text) text = context.lastComponent;
-		text ??= new Text("", 0, 0);
-		state.callText = text;
-		text.setText(output);
-		return text;
+		component ??= new CompactInvocationComponent();
+		state.callComponent = component;
+		component.setContent(prefix, invocation);
+		return component;
 	};
 
 	return {

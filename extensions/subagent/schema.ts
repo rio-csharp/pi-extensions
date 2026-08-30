@@ -40,12 +40,15 @@ export const SubagentParams = Type.Object({
 });
 
 export const SubagentJobsParams = Type.Object({
-	action: StringEnum(["list", "status", "resume", "cancel"] as const, {
+	action: StringEnum(["list", "status", "steer", "resume", "cancel"] as const, {
 		description: "Supervisor action",
 	}),
 	jobId: Type.Optional(Type.String({ description: "Background job id; required except for list" })),
+	taskIndex: Type.Optional(
+		Type.Integer({ minimum: 0, description: "Zero-based task index for steer; optional when exactly one child is running" }),
+	),
 	instruction: Type.Optional(
-		Type.String({ maxLength: 200000, description: "Optional continuation instruction when resuming the persisted child session" }),
+		Type.String({ maxLength: 200000, description: "Steering message for a running child, or optional continuation instruction when resuming" }),
 	),
 	includeOutput: Type.Optional(
 		Type.Boolean({

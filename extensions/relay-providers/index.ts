@@ -98,8 +98,9 @@ const MODEL_KEYS = new Set([
 ]);
 const COST_KEYS = new Set(["input", "output", "cacheRead", "cacheWrite", "tiers"]);
 const COST_TIER_KEYS = new Set(["inputTokensAbove", "input", "output", "cacheRead", "cacheWrite"]);
-const QUOTA_RETRY_KEYS = new Set(["maxRetries", "baseDelayMs", "errorSubstrings"]);
+const QUOTA_RETRY_KEYS = new Set(["maxRetries", "baseDelayMs", "backoff", "matchAll", "errorSubstrings"]);
 const MAX_STATUS_LABEL_LENGTH = 48;
+const API_KEY_PATTERN = /\bsk-[A-Za-z0-9_-]{12,}\b/g;
 
 interface RelayCostRates {
 	input: number;
@@ -133,6 +134,10 @@ interface RelayModelConfig {
 interface QuotaRetryConfig {
 	maxRetries?: number;
 	baseDelayMs?: number;
+	/** "exponential" (default) doubles baseDelayMs each attempt; "fixed" always waits baseDelayMs. */
+	backoff?: "exponential" | "fixed";
+	/** When true, retry any pre-stream error regardless of its message text. */
+	matchAll?: boolean;
 	/** Case-insensitive literal substrings. No implicit regex interpretation. */
 	errorSubstrings?: string[];
 }
@@ -184,6 +189,8 @@ interface RelayConfig {
 interface QuotaRetryOptions {
 	maxRetries: number;
 	baseDelayMs: number;
+	backoff: "exponential" | "fixed";
+	matchAll: boolean;
 	errorSubstrings: string[];
 }
 
@@ -435,6 +442,12 @@ function validateQuotaRetry(value: unknown, providerApi: unknown, path: string, 
 	) {
 		errors.push(`${path}.baseDelayMs must be an integer from 250 through ${MAX_RETRY_DELAY_MS}`);
 	}
+	if (value.backoff !== undefined && value.backoff !== "exponential" && value.backoff !== "fixed") {
+		errors.push(`${path}.backoff must be "exponential" or "fixed"`);
+	}
+	if (value.matchAll !== undefined && typeof value.matchAll !== "boolean") {
+		errors.push(`${path}.matchAll must be a boolean`);
+	}
 	if (value.errorSubstrings !== undefined) {
 		if (!Array.isArray(value.errorSubstrings) || value.errorSubstrings.length === 0) {
 			errors.push(`${path}.errorSubstrings must be a nonempty array of nonempty strings`);
@@ -556,30 +569,27 @@ function normalizeQuotaRetry(config: RelayProviderConfig["quotaRetry"]): QuotaRe
 	return {
 		maxRetries,
 		baseDelayMs: options.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS,
+		backoff: options.backoff ?? "exponential",
+		matchAll: options.matchAll === true,
 		errorSubstrings: [...(options.errorSubstrings ?? LEGACY_QUOTA_RETRY_ERROR_SUBSTRINGS)],
 	};
 }
 
 function isConfiguredRetryError(message: string | undefined, retry: QuotaRetryOptions): boolean {
+	if (retry.matchAll) return true;
 	if (!message) return false;
 	const normalized = message.toLocaleLowerCase();
 	return retry.errorSubstrings.some((substring) => normalized.includes(substring.toLocaleLowerCase()));
 }
 
-function sanitizeRelayError(message: AssistantMessage): AssistantMessage {
-	// Provider/SDK error strings are untrusted and can echo request headers or
-	// credentials. Do not attempt best-effort substring redaction: configured
-	// values are resolved inside Pi and are not all available to this extension.
-	const aborted = message.stopReason === "aborted";
-	return {
-		...message,
-		content: [],
-		diagnostics: undefined,
-		stopReason: aborted ? "aborted" : "error",
-		errorMessage: aborted
-			? "Request was aborted"
-			: "Relay request failed; inspect the relay without logging request credentials",
-	};
+export function redactRelayErrorText(value: string): string {
+	return value.replace(API_KEY_PATTERN, "<redacted>");
+}
+
+function passThroughRelayError(message: AssistantMessage): AssistantMessage {
+	if (!message.errorMessage) return message;
+	const errorMessage = redactRelayErrorText(message.errorMessage);
+	return errorMessage === message.errorMessage ? message : { ...message, errorMessage };
 }
 
 function waitForRetry(delayMs: number, signal?: AbortSignal): Promise<boolean> {
@@ -710,37 +720,38 @@ function createQuotaRetryStream(
 					return;
 				}
 
-				// Match before sanitizing so explicitly configured retry substrings retain
-				// their intended behavior, then discard the provider's raw error text.
 				const shouldRetry =
 					!emitted &&
 					!options?.signal?.aborted &&
 					requestError.stopReason === "error" &&
 					isConfiguredRetryError(requestError.errorMessage, retry) &&
 					attempt < retry.maxRetries;
-				const safeRequestError = sanitizeRelayError(requestError);
-				lastError = safeRequestError;
+				const rawRequestError = passThroughRelayError(requestError);
+				lastError = rawRequestError;
 
 				if (!shouldRetry) {
 					status.clear();
-					const aborted = options?.signal?.aborted || safeRequestError.stopReason === "aborted";
+					const aborted = options?.signal?.aborted || rawRequestError.stopReason === "aborted";
 					output.push({
 						type: "error",
 						reason: aborted ? "aborted" : "error",
-						error: aborted ? makeAbortedMessage(model, safeRequestError) : safeRequestError,
+						error: aborted ? makeAbortedMessage(model, rawRequestError) : rawRequestError,
 					});
 					output.end();
 					return;
 				}
 
 				attempt += 1;
-				const delayMs = Math.min(MAX_RETRY_DELAY_MS, retry.baseDelayMs * 2 ** (attempt - 1));
+				const delayMs =
+					retry.backoff === "fixed"
+						? retry.baseDelayMs
+						: Math.min(MAX_RETRY_DELAY_MS, retry.baseDelayMs * 2 ** (attempt - 1));
 				status.set(
 					`${providerLabel} configured retry · ${attempt}/${retry.maxRetries} in ${delayMs / 1000}s · Esc cancels`,
 				);
 				if (!(await waitForRetry(delayMs, options?.signal))) {
 					status.clear();
-					output.push({ type: "error", reason: "aborted", error: makeAbortedMessage(model, safeRequestError) });
+					output.push({ type: "error", reason: "aborted", error: makeAbortedMessage(model, rawRequestError) });
 					output.end();
 					return;
 				}
@@ -760,7 +771,7 @@ function createQuotaRetryStream(
 	};
 }
 
-function createSanitizedStream(api: string): OpenAICompletionsStream {
+function createPassThroughStream(api: string): OpenAICompletionsStream {
 	return (model, context, options) => {
 		const output = createAssistantMessageEventStream();
 		void (async () => {
@@ -768,11 +779,11 @@ function createSanitizedStream(api: string): OpenAICompletionsStream {
 			if (!implementation) throw new Error("unsupported API implementation");
 			for await (const event of implementation.streamSimple(model, context, options)) {
 				if (event.type === "error") {
-					const safeError = sanitizeRelayError(event.error);
+					const rawError = passThroughRelayError(event.error);
 					output.push({
 						type: "error",
-						reason: safeError.stopReason === "aborted" ? "aborted" : "error",
-						error: safeError,
+						reason: rawError.stopReason === "aborted" ? "aborted" : "error",
+						error: rawError,
 					});
 					continue;
 				}
@@ -836,12 +847,10 @@ function registerVisibleProviders(
 			// it to Azure, Codex, Anthropic, Google, Bedrock, or other API families.
 			authHeader: provider.authHeader ?? OPENAI_BEARER_APIS.has(api),
 			headers: provider.headers,
-			// Always wrap relay streams so provider/SDK errors cannot echo configured
-			// API keys or header values into the UI/session. Retry adds the same
-			// sanitization after matching the configured raw error substring.
+			// Preserve the provider error body while redacting API-key-like tokens.
 			streamSimple: (quotaRetry
 				? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker)
-				: createSanitizedStream(api)) as never,
+				: createPassThroughStream(api)) as never,
 			models: visibleModels.map((model) => buildModel(model, provider.compat)),
 		});
 	}

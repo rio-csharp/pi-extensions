@@ -9,6 +9,7 @@ Delegate tasks to specialized subagents with isolated context windows.
 - **Live footer status**: Running agents, their models, elapsed time, input/output/cache tokens, and cost update in the footer
 - **Parallel streaming**: Parallel task progress is collected continuously without flooding the conversation
 - **Usage tracking**: Completion lines distinguish input (`↑`), output (`↓`), cache read (`R`), and cache write (`W`) tokens
+- **Live steering**: The supervisor can route new instructions directly to a running child over Pi's RPC protocol
 - **Abort support**: Pi's interrupt signal propagates to terminate subagent processes
 
 ## Structure
@@ -75,13 +76,14 @@ Use a chain: first have general inspect the read tool, then have general propose
 
 ## Tool Modes
 
-Background supervision is enabled by default. Starting a job returns immediately with a `jobId`; call `subagent` again whenever another independent child should be created. Use `subagent_jobs` to list, inspect, cancel, or resume jobs. Resumed work reuses the child's persisted Pi session and the recorded effective `provider/model` selected when that child first ran, even if the parent model or agent definition later changes. Legacy snapshots that did not record a model omit the override and let Pi restore the child session's model.
+Background supervision is enabled by default. Starting a job returns immediately with a `jobId`; call `subagent` again whenever another independent child should be created. Use `subagent_jobs` to steer, list, inspect, cancel, or resume jobs. Resumed work reuses the child's persisted Pi session and the recorded effective `provider/model` selected when that child first ran, even if the parent model or agent definition later changes. Legacy snapshots that did not record a model omit the override and let Pi restore the child session's model.
 
 | Mode | Parameter | Description |
 |------|-----------|-------------|
 | Single | `{ agent, title, task }` | Start one independent child; call again later to create another |
-| Parallel | `{ tasks: [...] }` | Batch shortcut for multiple children (max 100, 20 concurrent globally) |
+| Parallel | `{ tasks: [...] }` | Batch shortcut for multiple children (unbounded task count and concurrency) |
 | Chain | `{ chain: [...] }` | Sequential with `{previous}` placeholder |
+| Live steer | `subagent_jobs { action: "steer", jobId, instruction, taskIndex? }` | Queue an instruction directly in a running child; `taskIndex` is zero-based and optional when exactly one child is active |
 | Synchronous compatibility | `background: false` | Wait for the invocation instead of returning a supervised job |
 
 ## Output Display
@@ -105,7 +107,7 @@ Cache-write (`W`) usage remains available in completion rows but is omitted from
 
 Partial output, child tool calls, final answers, and full supervisor notification bodies are not rendered in the conversation. Start and finish stay as compact one-line timeline rows even when Ctrl+O is enabled. Automatic completion, interruption, and cancellation messages render as a single count-and-elapsed-time row (for example, `✓ subagent job completed · 45/45 succeeded · 29m05s`). Their bounded full notification content still participates in the parent model's context so completion can steer or wake the main agent.
 
-`subagent_jobs` also has a dedicated compact renderer for `list`, `status`, `resume`, and `cancel`. Default `list`/`status` model results contain job metadata, aggregate succeeded/failed/pending/running counts, elapsed time, and at most five short failure diagnostics; they do not include successful task output. `list` is bounded to the 50 newest jobs. Structured tool `details` retain bounded result metadata and child session IDs used by rendering and supervision, while full child message arrays are omitted. The TUI always stays compact and never expands task output through Ctrl+O.
+`subagent_jobs` also has a dedicated compact renderer for `list`, `status`, `steer`, `resume`, and `cancel`. Default `list`/`status` model results contain job metadata, aggregate succeeded/failed/pending/running counts, elapsed time, and at most five short failure diagnostics; they do not include successful task output. `list` is bounded to the 50 newest jobs. Structured tool `details` retain bounded result metadata and child session IDs used by rendering and supervision, while full child message arrays are omitted. The TUI always stays compact and never expands task output through Ctrl+O.
 
 For explicit diagnostics, call:
 
@@ -113,7 +115,15 @@ For explicit diagnostics, call:
 subagent_jobs { action: "status", jobId: "sub-...", includeOutput: true }
 ```
 
-This opt-in adds task output to the **model-visible** status result with hard limits of 4 KB per task and 20 KB total. The TUI row remains compact; use the model to inspect or summarize the returned diagnostics. Background supervisor notifications have a 50 KB total cap, and synchronous parallel calls have a 50 KB per-task model-output cap.
+To redirect a running child without restarting its persisted session, call:
+
+```text
+subagent_jobs { action: "steer", jobId: "sub-...", taskIndex: 0, instruction: "Focus on the failing test first." }
+```
+
+Omit `taskIndex` when exactly one child process is currently running. The steering tool call and its compact acknowledgement remain in the main agent's context; the instruction is delivered directly to the selected child's context.
+
+The `status includeOutput` opt-in adds task output to the **model-visible** status result with hard limits of 4 KB per task and 20 KB total. The TUI row remains compact; use the model to inspect or summarize the returned diagnostics. Background supervisor notifications have a 50 KB total cap, and synchronous parallel calls have a 50 KB per-task model-output cap.
 
 Background persistence is append-only and delta-based: one immutable job definition is followed by small job/task state entries, rather than repeatedly embedding every prior result. This avoids quadratic session growth. Resume requires the child session id, effective model, original delegated prompt, job default cwd, and any per-task cwd, so those prompt/cwd fields are persisted **verbatim** in the parent session JSONL. Treat the parent session file as sensitive: delegated prompts can contain source, instructions, paths, or secrets. Raw prompts are omitted from structured background tool details and timeline rendering, but not from persistence because resumes explicitly restate the original task and chain templates need `{previous}` substitution. Each persisted task output is redacted on a best-effort basis and capped at 50 KB; complete in-memory output is still passed to the next step of a chain during the active run, while a chain reconstructed after restart can use only the bounded persisted handoff. Legacy full-snapshot `subagent-supervisor-job` entries remain readable.
 
@@ -173,5 +183,5 @@ The repository ships `agents/general.md`, a provider-neutral general-purpose def
 - Agents discovered fresh on each invocation (allows editing mid-session)
 - Project agent discovery can walk upward only to an explicitly supplied trusted project boundary; current tool/resume paths use cwd itself as that boundary because Pi exposes no arbitrary-path temporary-trust boundary. Directories and markdown files are canonicalized, and symlinks escaping the selected project-agent directory are ignored
 - Untrusted terminal controls (ANSI/OSC, C0/C1, and bidi controls) are removed from rendered title, agent, model, status, error, diagnostic, and timeline metadata
-- Parallel mode is limited to 100 tasks per call, with up to 20 concurrent processes globally across supervised jobs
-- Subagents may recursively spawn children for up to 3 child levels; agents at the third child level are leaves
+- Parallel mode has no task-count or concurrency cap; tasks are started immediately, so use it carefully to avoid exhausting local resources or provider quotas
+- Subagents may recursively spawn children for up to 5 child levels; agents at the fifth child level are leaves

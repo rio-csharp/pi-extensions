@@ -9,7 +9,7 @@
  *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
  *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
  *
- * Uses JSON mode to capture structured output from subagents.
+ * Uses RPC mode to capture structured output and steer running subagents.
  */
 
 import { spawn } from "node:child_process";
@@ -17,6 +17,7 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import {
@@ -43,11 +44,10 @@ import type {
 	SubagentMode,
 } from "./types.ts";
 
-const MAX_PARALLEL_TASKS = 100;
-const MAX_CONCURRENCY = 20;
-// The root pi process is depth 0. A subagent at depth 3 is a leaf and
-// cannot create more subagents, allowing three nested child levels.
-const MAX_SUBAGENT_DEPTH = 3;
+const UNLIMITED_CONCURRENCY = Number.POSITIVE_INFINITY;
+// The root pi process is depth 0. A subagent at depth 5 is a leaf and
+// cannot create more subagents, allowing five nested child levels.
+const MAX_SUBAGENT_DEPTH = 5;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
 const SUPERVISOR_MESSAGE_CAP = 50 * 1024;
@@ -189,6 +189,10 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
 
 type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 
+interface RunningChildControl {
+	steer(instruction: string): Promise<void>;
+}
+
 interface BackgroundTask {
 	agent: string;
 	title: string;
@@ -200,6 +204,7 @@ interface BackgroundTask {
 	output?: string;
 	result?: SingleResult;
 	model?: string;
+	control?: RunningChildControl;
 }
 
 interface BackgroundJob {
@@ -225,7 +230,7 @@ interface PersistedBackgroundJob {
 	projectAgentsDir: string | null;
 	defaultCwd: string;
 	confirmProjectAgents?: boolean;
-	tasks: Array<Omit<BackgroundTask, "result">>;
+	tasks: Array<Omit<BackgroundTask, "result" | "control">>;
 	status: BackgroundJobStatus;
 	startedAt: number;
 	finishedAt?: number;
@@ -274,6 +279,7 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 	onStatusUpdate?: (result: SingleResult) => void,
+	onControlChange?: (control: RunningChildControl | undefined) => void,
 ): Promise<SingleResult> {
 	const agent = agents.find((a) => a.name === agentName);
 
@@ -291,7 +297,7 @@ async function runSingleAgent(
 		};
 	}
 
-	const args: string[] = ["--mode", "json", "-p"];
+	const args: string[] = ["--mode", "rpc"];
 	if (sessionId) args.push("--session-id", sessionId);
 	else args.push("--no-session");
 	// Callers pass the already resolved effective model. This also preserves the
@@ -335,7 +341,6 @@ async function runSingleAgent(
 			args.push("--append-system-prompt", tmpPromptPath);
 		}
 
-		args.push(`Task: ${task}`);
 		let wasAborted = false;
 
 		const exitCode = await new Promise<number>((resolve) => {
@@ -343,24 +348,102 @@ async function runSingleAgent(
 			const proc = spawn(invocation.command, invocation.args, {
 				cwd: cwd ?? defaultCwd,
 				shell: false,
-				stdio: ["ignore", "pipe", "pipe"],
+				stdio: ["pipe", "pipe", "pipe"],
 				env: {
 					...buildChildEnvironment(process.env, provider, providerEnvironmentNames),
 					PI_SUBAGENT_ACTIVE: "1",
 					[SUBAGENT_DEPTH_ENV]: String(getSubagentDepth() + 1),
 				},
 			});
+			const stdoutDecoder = new StringDecoder("utf8");
 			let buffer = "";
 			let processClosed = false;
+			let agentSettled = false;
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 			let abortListener: (() => void) | undefined;
+			let requestId = 0;
+			const pendingRequests = new Map<string, {
+				resolve: () => void;
+				reject: (error: Error) => void;
+				timer: ReturnType<typeof setTimeout>;
+			}>();
 
-			const processLine = (line: string) => {
+			const rejectPendingRequests = (error: Error) => {
+				for (const pending of pendingRequests.values()) {
+					clearTimeout(pending.timer);
+					pending.reject(error);
+				}
+				pendingRequests.clear();
+			};
+
+			const writeRpcLine = (value: object) => {
+				if (processClosed || proc.stdin.destroyed || !proc.stdin.writable) {
+					throw new Error("Subagent RPC input is no longer writable");
+				}
+				proc.stdin.write(`${JSON.stringify(value)}\n`);
+			};
+
+			const sendRpcCommand = (type: "prompt" | "steer", message: string): Promise<void> => {
+				const id = `subagent_${++requestId}`;
+				return new Promise((resolveRequest, rejectRequest) => {
+					const timer = setTimeout(() => {
+						pendingRequests.delete(id);
+						rejectRequest(new Error(`Timed out waiting for subagent RPC ${type} response`));
+					}, 30_000);
+					timer.unref?.();
+					pendingRequests.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
+					try {
+						writeRpcLine({ id, type, message });
+					} catch (error) {
+						clearTimeout(timer);
+						pendingRequests.delete(id);
+						rejectRequest(error instanceof Error ? error : new Error(String(error)));
+					}
+				});
+			};
+
+			const retireControl = () => onControlChange?.(undefined);
+			const requestGracefulClose = () => {
+				if (proc.stdin.writable && !proc.stdin.destroyed) proc.stdin.end();
+				if (!forceKillTimer) {
+					forceKillTimer = setTimeout(() => {
+						if (!processClosed) proc.kill("SIGTERM");
+					}, 5000);
+					forceKillTimer.unref?.();
+				}
+			};
+
+			const processLine = (rawLine: string) => {
+				const line = rawLine.endsWith("\r") ? rawLine.slice(0, -1) : rawLine;
 				if (!line.trim()) return;
 				let event: any;
 				try {
 					event = JSON.parse(line);
 				} catch {
+					return;
+				}
+
+				if (event.type === "response" && typeof event.id === "string") {
+					const pending = pendingRequests.get(event.id);
+					if (pending) {
+						clearTimeout(pending.timer);
+						pendingRequests.delete(event.id);
+						if (event.success) pending.resolve();
+						else pending.reject(new Error(typeof event.error === "string" ? event.error : `Subagent RPC ${event.command ?? "command"} failed`));
+					}
+					return;
+				}
+
+				// Headless subagents cannot service interactive extension dialogs. Cancel
+				// them explicitly so an RPC child never waits forever for a UI client.
+				if (event.type === "extension_ui_request") {
+					if (["select", "confirm", "input", "editor"].includes(event.method) && typeof event.id === "string") {
+						try {
+							writeRpcLine({ type: "extension_ui_response", id: event.id, cancelled: true });
+						} catch {
+							// Process shutdown will report the transport failure.
+						}
+					}
 					return;
 				}
 
@@ -393,10 +476,16 @@ async function runSingleAgent(
 					currentResult.messages.push(event.message as Message);
 					emitUpdate();
 				}
+
+				if (event.type === "agent_settled") {
+					agentSettled = true;
+					retireControl();
+					requestGracefulClose();
+				}
 			};
 
 			proc.stdout.on("data", (data) => {
-				buffer += data.toString();
+				buffer += stdoutDecoder.write(data);
 				const lines = buffer.split("\n");
 				buffer = lines.pop() || "";
 				for (const line of lines) processLine(line);
@@ -410,12 +499,20 @@ async function runSingleAgent(
 				);
 			});
 
+			proc.stdin.on("error", (error) => {
+				if (processClosed) return;
+				rejectPendingRequests(error);
+			});
+
 			proc.on("close", (code, signalName) => {
 				processClosed = true;
+				retireControl();
 				if (forceKillTimer) clearTimeout(forceKillTimer);
 				if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+				buffer += stdoutDecoder.end();
 				if (buffer.trim()) processLine(buffer);
-				if (code === null) {
+				rejectPendingRequests(new Error(`Subagent RPC process closed (code=${code}, signal=${signalName ?? "none"})`));
+				if (code === null && !agentSettled) {
 					currentResult.stderr = appendBounded(
 						currentResult.stderr,
 							`${currentResult.stderr ? "\n" : ""}Subagent process terminated by ${signalName ?? "an unknown signal"}`,
@@ -424,7 +521,7 @@ async function runSingleAgent(
 					resolve(1);
 					return;
 				}
-				resolve(code);
+				resolve(code ?? 0);
 			});
 
 			proc.on("error", (error) => {
@@ -440,6 +537,7 @@ async function runSingleAgent(
 			if (signal) {
 				abortListener = () => {
 					wasAborted = true;
+					retireControl();
 					proc.kill("SIGTERM");
 					forceKillTimer = setTimeout(() => {
 						if (!processClosed) proc.kill("SIGKILL");
@@ -448,6 +546,28 @@ async function runSingleAgent(
 				};
 				if (signal.aborted) abortListener();
 				else signal.addEventListener("abort", abortListener, { once: true });
+			}
+
+			if (!wasAborted) {
+				void sendRpcCommand("prompt", `Task: ${task}`)
+					.then(() => {
+						if (processClosed || agentSettled) return;
+						onControlChange?.({
+							steer: async (instruction) => {
+								if (processClosed || agentSettled) throw new Error("Subagent is no longer running");
+								await sendRpcCommand("steer", instruction);
+							},
+						});
+					})
+					.catch((error) => {
+						currentResult.stopReason = "error";
+						currentResult.errorMessage = sanitizeBounded(
+							error instanceof Error ? error.message : String(error),
+							RESULT_DIAGNOSTIC_CAP,
+							"RPC error truncated",
+						);
+						requestGracefulClose();
+					});
 			}
 		});
 
@@ -532,7 +652,7 @@ export default function (pi: ExtensionAPI) {
 
 	const acquireSubagentSlot = (signal: AbortSignal): Promise<() => void> => {
 		if (signal.aborted) return Promise.reject(new Error("Subagent job was canceled while queued"));
-		if (activeSubagentSlots < MAX_CONCURRENCY) {
+		if (activeSubagentSlots < UNLIMITED_CONCURRENCY) {
 			activeSubagentSlots++;
 			return Promise.resolve(releaseSubagentSlot);
 		}
@@ -753,6 +873,7 @@ export default function (pi: ExtensionAPI) {
 				task.completed = false;
 				task.output = undefined;
 				task.result = undefined;
+				task.control = undefined;
 				if (!isPersistedResume) {
 					task.model ??= agents.find((agent) => agent.name === task.agent)?.model ?? getContextModel(ctx);
 				}
@@ -788,6 +909,10 @@ export default function (pi: ExtensionAPI) {
 									}
 									onStatusUpdate(result);
 								},
+								(control) => {
+									if (!isJobRuntimeCurrent(job, runGeneration)) return;
+									task.control = control;
+								},
 							),
 						task.model,
 					),
@@ -819,7 +944,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			} else {
 				const pending = job.tasks.map((task, index) => ({ task, index })).filter(({ task }) => !task.completed);
-				await mapWithConcurrencyLimit(pending, MAX_CONCURRENCY, async ({ task, index }) => {
+				await mapWithConcurrencyLimit(pending, UNLIMITED_CONCURRENCY, async ({ task, index }) => {
 					const prompt = task.attempts > 0
 						? `${continuation?.trim() || "Continue the previous task from its persisted session."}\n\nOriginal task:\n${task.task}`
 						: task.task;
@@ -975,7 +1100,7 @@ export default function (pi: ExtensionAPI) {
 			"Each call may start one independent subagent; call this tool again later to create more one by one.",
 			"Batch parallel and sequential chain modes are also supported.",
 			"Completion or interruption is delivered automatically as a steering message and triggers the main agent when idle.",
-			"Use subagent_jobs to inspect, resume, or cancel supervised jobs.",
+			"Use subagent_jobs to steer a running child or inspect, resume, and cancel supervised jobs.",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
@@ -1061,13 +1186,6 @@ export default function (pi: ExtensionAPI) {
 					: hasTasks
 						? params.tasks!
 						: [{ agent: params.agent!, title: params.title!, task: params.task!, cwd: params.cwd }];
-
-				if (requested.length > MAX_PARALLEL_TASKS) {
-					return {
-						content: [{ type: "text", text: `Too many background tasks (${requested.length}). Max is ${MAX_PARALLEL_TASKS}.` }],
-						details: makeDetails(mode)([]),
-					};
-				}
 
 				const unknown = requested.map((item) => item.agent).filter((name) => !agents.some((agent) => agent.name === name));
 				if (unknown.length > 0) {
@@ -1182,18 +1300,6 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (params.tasks && params.tasks.length > 0) {
-				if (params.tasks.length > MAX_PARALLEL_TASKS)
-					return {
-						content: [
-							{
-								type: "text",
-								text: `Too many parallel tasks (${params.tasks.length}). Max is ${MAX_PARALLEL_TASKS}.`,
-							},
-						],
-						details: makeDetails("parallel")([]),
-					};
-
-				// Track all results for streaming updates
 				const allResults: SingleResult[] = new Array(params.tasks.length);
 
 				// Initialize placeholder results
@@ -1222,7 +1328,7 @@ export default function (pi: ExtensionAPI) {
 					}
 				};
 
-				const results = await mapWithConcurrencyLimit(params.tasks, MAX_CONCURRENCY, async (t, index) => {
+				const results = await mapWithConcurrencyLimit(params.tasks, UNLIMITED_CONCURRENCY, async (t, index) => {
 					const slotSignal = signal ?? new AbortController().signal;
 					const result = await withSubagentSlot(slotSignal, () =>
 						whileRunning(
@@ -1338,7 +1444,8 @@ export default function (pi: ExtensionAPI) {
 		renderResult: subagentJobsRenderer.renderResult,
 		description: [
 			"Manage supervised background subagent jobs.",
-			"Use list/status to inspect without waiting, resume to continue an interrupted child from its persisted session, and cancel to stop it.",
+			"Use steer to redirect a running child, list/status to inspect without waiting, resume to continue an interrupted child from its persisted session, and cancel to stop it.",
+			"For parallel jobs, steer accepts a zero-based taskIndex; it may be omitted when exactly one child is running.",
 			"Status is compact by default. Set includeOutput=true only for bounded diagnostic task output.",
 			"Never poll a running job repeatedly; completion and interruption notifications are automatic.",
 		].join(" "),
@@ -1380,6 +1487,74 @@ export default function (pi: ExtensionAPI) {
 					content: [{ type: "text", text: summarizeJob(job, params.includeOutput === true) }],
 					details: jobDetails(job),
 				};
+			}
+
+			if (params.action === "steer") {
+				const instruction = params.instruction?.trim();
+				if (!instruction) {
+					return {
+						content: [{ type: "text", text: "action=steer requires a non-empty instruction." }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+				if (job.status !== "running") {
+					return {
+						content: [{ type: "text", text: `Cannot steer ${job.id}; job status is ${job.status}.` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+
+				let taskIndex = params.taskIndex;
+				if (taskIndex === undefined) {
+					const runningIndexes = job.tasks
+						.map((task, index) => task.control ? index : -1)
+						.filter((index) => index >= 0);
+					if (runningIndexes.length !== 1) {
+						return {
+							content: [{
+								type: "text",
+								text: runningIndexes.length === 0
+									? `No child in ${job.id} is currently accepting steering messages.`
+									: `${job.id} has ${runningIndexes.length} running children; provide taskIndex (${runningIndexes.join(", ")}).`,
+							}],
+							details: jobDetails(job),
+							isError: true,
+						};
+					}
+					taskIndex = runningIndexes[0];
+				}
+
+				const task = job.tasks[taskIndex];
+				if (!task) {
+					return {
+						content: [{ type: "text", text: `Invalid taskIndex ${taskIndex}; ${job.id} has ${job.tasks.length} task(s), indexed 0-${Math.max(0, job.tasks.length - 1)}.` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+				if (!task.control) {
+					return {
+						content: [{ type: "text", text: `Task ${taskIndex} (${boundedMetadata(task.title)}) is not currently accepting steering messages.` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
+
+				try {
+					await task.control.steer(instruction);
+					return {
+						content: [{ type: "text", text: `Steering instruction queued for task ${taskIndex} (${boundedMetadata(task.title)}) in ${job.id}.` }],
+						details: jobDetails(job),
+					};
+				} catch (error) {
+					return {
+						content: [{ type: "text", text: `Failed to steer task ${taskIndex} in ${job.id}: ${compactDiagnostic(error instanceof Error ? error.message : String(error)) ?? "unknown RPC error"}` }],
+						details: jobDetails(job),
+						isError: true,
+					};
+				}
 			}
 
 			if (params.action === "cancel") {
