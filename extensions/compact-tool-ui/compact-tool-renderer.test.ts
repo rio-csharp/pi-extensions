@@ -98,6 +98,7 @@ test("all overridden built-in tools use the shared capped renderer without mutat
 		registerTool(tool: RegisteredTool) {
 			tools.set(tool.name, tool);
 		},
+		registerMarkdownTransformer() {},
 		on() {},
 	} as unknown as ExtensionAPI;
 	compactToolUi(pi);
