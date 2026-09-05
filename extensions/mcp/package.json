@@ -5,7 +5,7 @@
   "main": "index.ts",
   "type": "module",
   "scripts": {
-    "test": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --skipLibCheck --outDir .test-dist index.ts && node --test security.test.mjs && node -e \"require('node:fs').rmSync('.test-dist',{recursive:true,force:true})\""
+    "test": "tsc --target ES2022 --module NodeNext --moduleResolution NodeNext --strict --skipLibCheck --outDir .test-dist index.ts && node --test security.test.mjs && node -e \"require('node:fs').rmSync('.test-dist',{recursive:true,force:true})\""
   },
   "keywords": [
     "pi",

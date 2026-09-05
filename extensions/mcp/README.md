@@ -13,10 +13,15 @@ A Pi extension that connects remote Model Context Protocol servers through the s
 - Bearer-token authentication through environment-variable references (no plaintext terminal prompt)
 - Automatic tool and resource discovery
 - Immediate tool deactivation when a server is disabled or removed
-- Cached tool restoration during `/reload`
 - Background MCP reconnection during `/reload`
 - Bounded paginated tool and resource discovery
 - Secure configuration-file permissions
+
+## Internal architecture
+
+The extension is intentionally split by responsibility. `index.ts` is only the composition root: it creates `McpRuntime` and registers the extension. Configuration and credential persistence live in `config-store.ts`; OAuth is isolated in `oauth.ts`; HTTP transport, connection lifecycle, and paginated discovery are handled by `connection-manager.ts`; tool/resource registration is handled by `tool-registry.ts`; and command parsing is kept in `commands.ts`. Shared types, security policy, result formatting, and compact rendering are in their own modules.
+
+This keeps the runtime state in one coordinator while preventing the Pi registration layer, authentication flow, persistence, and remote-result formatting from becoming coupled again.
 
 Only Streamable HTTP is currently supported. Stdio servers are not supported.
 
@@ -64,10 +69,11 @@ Inspect the connection:
 
 ## Commands
 
+Running `/mcp` with no arguments shows the command help.
+
 ### List servers
 
 ```text
-/mcp
 /mcp list
 /mcp list --details
 ```
@@ -117,7 +123,7 @@ On PowerShell, set `$env:INTERNAL_MCP_TOKEN = '...'` before starting Pi. `/mcp a
 /mcp connect <name>
 ```
 
-This reconnects the server and refreshes its cached tools and resources.
+This reconnects the server and refreshes its in-memory tools and resources.
 
 ### Authenticate
 
@@ -144,18 +150,6 @@ Disabling a server closes its connection and immediately deactivates its tools w
 ```
 
 Removal closes the connection, deactivates the tools, and persists immediately. Removing the final server correctly writes an empty `servers` object; `/reload` is not required.
-
-### Test an endpoint
-
-```text
-/mcp-test <url>
-```
-
-Typical results:
-
-- `Valid MCP endpoint; authentication is required` — the endpoint is valid; add it with OAuth or bearer authentication.
-- `Valid MCP endpoint: N tools, M resources` — the endpoint connected successfully.
-- `MCP test failed: ...` — inspect the message for URL, TLS, network, or protocol errors.
 
 ## Configuration scopes
 
@@ -196,13 +190,13 @@ A simplified configuration looks like this:
 }
 ```
 
-The configuration files store server definitions, discovered tool/resource metadata, connection timestamps, and non-secret OAuth options. Authentication secrets are kept separately in:
+The configuration files store only initial connection settings: server definitions and non-secret OAuth options. Runtime state (discovered tools/resources, connection timestamps, errors) is kept in memory and never written to disk. Authentication secrets are kept separately in:
 
 ```text
 ~/.pi/agent/.credentials.json
 ```
 
-The credential store uses a Claude-style `mcpOAuth` map keyed by server name and a hash of the server URL. It contains OAuth client registration, access/refresh tokens, token expiry, PKCE state while authentication is in progress, and cached OAuth discovery metadata. Existing embedded bearer tokens are migrated to the adjacent `mcpBearer` map for backward compatibility, but newly configured bearer credentials use `bearerTokenEnv` and are never persisted by this extension.
+The credential store uses a Claude-style `mcpOAuth` map keyed by server name and a hash of the server URL. It contains only login state: OAuth client registration (`client_id`/`client_secret` from dynamic registration, required to use the refresh token), access/refresh tokens, and token expiry. PKCE verifiers and OAuth discovery metadata are never persisted; discovery is repeated when needed. Bearer credentials use `bearerTokenEnv` and are never persisted by this extension.
 
 ## OAuth behavior
 

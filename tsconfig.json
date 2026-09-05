@@ -11,6 +11,7 @@
   },
   "include": [
     "extensions/compact-tool-ui/**/*.ts",
+    "extensions/mcp/**/*.ts",
     "extensions/relay-footer/**/*.ts",
     "extensions/relay-providers/**/*.ts",
     "extensions/subagent/**/*.ts",
