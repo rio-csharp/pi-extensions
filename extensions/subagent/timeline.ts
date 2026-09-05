@@ -2,6 +2,7 @@ import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
 import type { AgentScope } from "./agents.ts";
 import { terminalSanitize } from "./security.ts";
+import { formatClock, formatElapsed, formatTokens, isFailedResult } from "./text.ts";
 import type {
 	BackgroundJobStatus,
 	SingleResult,
@@ -40,8 +41,8 @@ interface SubagentArgs {
 	task?: string;
 	background?: boolean;
 	agentScope?: AgentScope;
-	tasks?: Array<{ agent: string; title: string; task: string }>;
-	chain?: Array<{ agent: string; title: string; task: string }>;
+	tasks?: Array<{ agent?: string; title: string; task: string }>;
+	chain?: Array<{ agent?: string; title: string; task: string }>;
 }
 
 class EmptyComponent implements Component {
@@ -52,39 +53,12 @@ class EmptyComponent implements Component {
 	invalidate(): void {}
 }
 
-function formatClock(timestamp: number): string {
-	return new Date(timestamp).toLocaleTimeString(undefined, {
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-		hour12: false,
-	});
-}
-
-function formatElapsed(milliseconds: number): string {
-	if (milliseconds < 1000) return `${Math.max(0, Math.round(milliseconds))}ms`;
-	const totalSeconds = Math.floor(milliseconds / 1000);
-	if (totalSeconds < 60) return `${totalSeconds}s`;
-	const hours = Math.floor(totalSeconds / 3600);
-	const minutes = Math.floor((totalSeconds % 3600) / 60);
-	const seconds = totalSeconds % 60;
-	if (hours > 0) return `${hours}h${minutes.toString().padStart(2, "0")}m${seconds.toString().padStart(2, "0")}s`;
-	return `${minutes}m${seconds.toString().padStart(2, "0")}s`;
-}
-
 function shortJobId(jobId: string | undefined): string {
 	if (!jobId) return "unknown";
 	const safeJobId = terminalSanitize(jobId);
 	const prefix = safeJobId.startsWith("sub-") ? "sub-" : "";
 	const body = prefix ? safeJobId.slice(prefix.length) : safeJobId;
 	return body.length > 8 ? `${prefix}${body.slice(0, 8)}` : safeJobId;
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return count.toString();
-	if (count < 10000) return `${(count / 1000).toFixed(1)}k`;
-	if (count < 1000000) return `${Math.round(count / 1000)}k`;
-	return `${(count / 1000000).toFixed(1)}M`;
 }
 
 function compactTitle(value: string | undefined, fallback: string): string {
@@ -109,11 +83,7 @@ function describeStart(args: SubagentArgs): string {
 		return `parallel · ${args.tasks.length} tasks${titles ? ` · ${titles}` : ""} · ${scope}`;
 	}
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${terminalSanitize(args.agent ?? "unknown agent")} · ${scope}`;
-}
-
-function isFailedResult(result: SingleResult): boolean {
-	return result.exitCode !== 0 || result.stopReason === "error" || result.stopReason === "aborted";
+	return `${title} · ${terminalSanitize(args.agent ?? "default")} · ${scope}`;
 }
 
 function aggregateUsage(results: SingleResult[]): UsageStats {
@@ -170,7 +140,7 @@ function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined
 
 	const result = details.results[0];
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${terminalSanitize(result?.agent ?? args.agent ?? "unknown agent")}`;
+	return `${title} · ${terminalSanitize(result?.agent ?? args.agent ?? "default")}`;
 }
 
 function classifyOutcome(
@@ -183,7 +153,7 @@ function classifyOutcome(
 	if (/^Canceled:/i.test(text) || details?.jobStatus === "canceled") return "canceled";
 	if (context.isError || details?.results.some(isFailedResult)) return "failed";
 	if (details?.jobStatus === "failed" || details?.jobStatus === "interrupted") return "failed";
-	if (/^(Invalid parameters|Too many (parallel|background) tasks|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
+	if (/^(Invalid parameters|Unknown agents|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
 	return "completed";
 }
 
@@ -282,7 +252,7 @@ function formatTaskCounts(details: SubagentDetails | undefined): string {
 	return `${counts.succeeded} succeeded · ${counts.failed} failed · ${counts.pending} pending · ${counts.running} running`;
 }
 
-export function renderSubagentSupervisorMessage(message: any, theme: Theme): Component {
+export function renderSupervisorMessage(message: any, theme: Theme): Component {
 	const details = message.details as SubagentDetails | undefined;
 	const finishedAt = details?.finishedAt ?? Date.now();
 	const startedAt = details?.startedAt ?? finishedAt;
@@ -305,20 +275,18 @@ interface SubagentJobsArgs {
 	includeOutput?: boolean;
 }
 
-function jobsDetails(result: any): SubagentDetails[] {
-	const details = resultDetails(result);
-	if (!details) return [];
-	return "jobs" in details ? details.jobs : [details];
-}
-
-function resultDetails(
-	result: any,
-): SubagentDetails | SubagentJobsDetails | undefined {
+function resultDetails(result: any): SubagentDetails | SubagentJobsDetails | undefined {
 	const details = result?.details;
 	if (!details || typeof details !== "object") return undefined;
 	if ("jobs" in details && Array.isArray(details.jobs)) return details as SubagentJobsDetails;
 	if ("mode" in details && Array.isArray(details.results)) return details as SubagentDetails;
 	return undefined;
+}
+
+function jobsDetails(result: any): SubagentDetails[] {
+	const details = resultDetails(result);
+	if (!details) return [];
+	return "jobs" in details ? details.jobs : [details];
 }
 
 function describeJobsResult(args: SubagentJobsArgs, result: any, isError: boolean): string {

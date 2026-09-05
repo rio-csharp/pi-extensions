@@ -1,15 +1,19 @@
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Type } from "typebox";
 
+const AgentName = Type.Optional(
+	Type.String({ minLength: 1, maxLength: 128, description: "Name of the agent to invoke. Omit to run with pi defaults (current model, default tools)." }),
+);
+
 const TaskItem = Type.Object({
-	agent: Type.String({ minLength: 1, maxLength: 128, description: "Name of the agent to invoke" }),
+	agent: AgentName,
 	title: Type.String({ minLength: 1, maxLength: 160, description: "Concise status title chosen by the main agent" }),
 	task: Type.String({ minLength: 1, maxLength: 200000, description: "Task to delegate to the agent" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
 });
 
 const ChainItem = Type.Object({
-	agent: Type.String({ minLength: 1, maxLength: 128, description: "Name of the agent to invoke" }),
+	agent: AgentName,
 	title: Type.String({ minLength: 1, maxLength: 160, description: "Concise status title chosen by the main agent" }),
 	task: Type.String({ minLength: 1, maxLength: 200000, description: "Task with optional {previous} placeholder for prior output" }),
 	cwd: Type.Optional(Type.String({ description: "Working directory for the agent process" })),
@@ -21,11 +25,11 @@ const AgentScopeSchema = StringEnum(["user", "project", "both"] as const, {
 });
 
 export const SubagentParams = Type.Object({
-	agent: Type.Optional(Type.String({ minLength: 1, maxLength: 128, description: "Name of the agent to invoke (for single mode)" })),
+	agent: AgentName,
 	title: Type.Optional(Type.String({ minLength: 1, maxLength: 160, description: "Concise status title chosen by the main agent (single mode)" })),
 	task: Type.Optional(Type.String({ minLength: 1, maxLength: 200000, description: "Task to delegate (for single mode)" })),
-	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent, task} for parallel execution" })),
-	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent, task} for sequential execution" })),
+	tasks: Type.Optional(Type.Array(TaskItem, { description: "Array of {agent?, title, task} for parallel execution" })),
+	chain: Type.Optional(Type.Array(ChainItem, { description: "Array of {agent?, title, task} for sequential execution" })),
 	background: Type.Optional(
 		Type.Boolean({
 			description: "Run under the background supervisor and return immediately. Defaults to true.",
