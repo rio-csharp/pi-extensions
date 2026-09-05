@@ -15,3 +15,4 @@ Optional `quotaRetry` (only for `openai-completions` providers) retries matching
 - Invalid config never blocks pi: the extension logs an error and registers nothing
 - Unknown root/provider keys only produce startup warnings, so companion extensions (e.g. relay-balance) can read extra fields from the same file
 - Relay error bodies are passed through, but API-key-like tokens are redacted before display
+- To make a relay model the default, set `defaultProvider`/`defaultModel` in `~/.pi/agent/settings.json` (pi core settings)
