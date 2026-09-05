@@ -14,6 +14,15 @@ const TRANSPORT_EXIT_CODES = new Set([5, 6, 7, 28, 35, 52, 56]);
 
 export class TransportError extends Error {}
 
+// DNS-poisoned domains resolve to reserved addresses; IP literals typed by the caller must never be relayed.
+export class BlockedHostError extends Error {
+	readonly literalIp: boolean;
+	constructor(message: string, literalIp: boolean) {
+		super(message);
+		this.literalIp = literalIp;
+	}
+}
+
 export interface RequestOptions {
 	timeoutMs?: number;
 	extraArgs?: string[];
@@ -98,7 +107,10 @@ export async function resolvePublicUrl(value: string | URL): Promise<{ url: URL;
 		throw new Error("The URL host could not be resolved safely");
 	}
 	if (addresses.length === 0 || addresses.some(isPrivateAddress)) {
-		throw new Error("Private, loopback, link-local, multicast, reserved, and unresolved hosts are not allowed");
+		throw new BlockedHostError(
+			"Private, loopback, link-local, multicast, reserved, and unresolved hosts are not allowed",
+			isIP(host) !== 0,
+		);
 	}
 	return { url, addresses: [...new Set(addresses)] };
 }

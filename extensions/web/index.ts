@@ -9,7 +9,7 @@ import { Type } from "typebox";
 import { createCompactRenderer } from "./compact-tool-renderer.ts";
 import { loadWebConfig } from "./config.ts";
 import { resolveSearchProviders, runSearch } from "./search.ts";
-import { TransportError, displayUrl, ensureCurlVersion, fetchPublic, parseWebUrl, sanitizeMessage } from "./transport.ts";
+import { BlockedHostError, TransportError, displayUrl, ensureCurlVersion, fetchPublic, parseWebUrl, sanitizeMessage } from "./transport.ts";
 import { htmlToText, sanitizeContentText, stripTags } from "./text.ts";
 
 const MAX_FETCH_BYTES = 1024 * 1024;
@@ -110,7 +110,9 @@ export default function (pi: ExtensionAPI) {
 				fetched = await fetchPublic(pi, parseWebUrl(requestedUrl), "=http,https", MAX_TRANSFER_BYTES, signal);
 			} catch (directError) {
 				const relay = config.fetchRelay;
-				if (!(directError instanceof TransportError) || !relay || signal?.aborted) {
+				const relayable = directError instanceof TransportError
+					|| (directError instanceof BlockedHostError && !directError.literalIp);
+				if (!relayable || !relay || signal?.aborted) {
 					throw new Error(`web_fetch failed: ${sanitizeMessage(directError instanceof Error ? directError.message : String(directError))}`);
 				}
 				try {
