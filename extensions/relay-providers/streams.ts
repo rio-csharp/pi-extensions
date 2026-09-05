@@ -1,8 +1,3 @@
-/**
- * Relay streaming: pass-through streams for every supported API family and the
- * opt-in, cancelable pre-output quota retry wrapper for openai-completions.
- * Provider error bodies are preserved while API-key-like tokens are redacted.
- */
 
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
@@ -154,8 +149,7 @@ export function createQuotaRetryStream(
 						continue;
 					}
 
-					// OpenAI Completions emits `start` only after the HTTP request succeeds.
-					// Never retry after that point, because output might otherwise be duplicated.
+					// Never retry once output has started: a later retry could duplicate billed output.
 					emitted = true;
 					status.clear();
 					output.push(event);

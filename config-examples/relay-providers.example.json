@@ -6,50 +6,22 @@
       "baseUrl": "https://your-provider.example/v1",
       "apiKey": "$YOUR_PROVIDER_API_KEY",
       "api": "openai-completions",
-      "authHeader": true,
-      "headers": {
-        "X-Relay-Client": "pi"
-      },
-      "compat": {
-        "supportsDeveloperRole": false
-      },
-      "hidden": false,
       "quotaRetry": {
         "maxRetries": 3,
-        "baseDelayMs": 2000,
-        "errorSubstrings": [
-          "temporary quota allocation unavailable"
-        ]
+        "baseDelayMs": 2000
       },
       "models": [
         {
           "id": "your-model-id",
-          "baseUrl": "https://your-provider.example/v1",
-          "hidden": false,
           "reasoning": true,
           "contextWindow": 128000,
-          "maxTokens": 16384,
-          "cost": {
-            "input": 0,
-            "output": 0,
-            "cacheRead": 0,
-            "cacheWrite": 0
-          },
-          "headers": {
-            "X-Relay-Model": "your-model-id"
-          },
-          "compat": {
-            "supportsReasoningEffort": true
-          }
+          "maxTokens": 16384
+        },
+        {
+          "id": "your-hidden-model-id",
+          "hidden": true
         }
       ]
     }
-  ],
-  "_notes": [
-    "HTTPS is required by default. For an intentionally local/private plain-HTTP relay, set allowInsecureHttp to true; HTTP is then limited to localhost or a literal loopback/private/link-local address. Credentials and headers sent over HTTP are not encrypted.",
-    "baseUrl values must not contain URL userinfo (user:password@host). Put authentication in apiKey or headers instead, and avoid putting credentials in URL query parameters.",
-    "apiKey and header values follow Pi config-value syntax. Prefer $ENV_VAR. A leading !command deliberately runs a trusted local credential command as the Pi user; use $! for a literal leading exclamation mark, and never embed a secret in command text.",
-    "authHeader defaults to true only for openai-completions and openai-responses; set it explicitly for clarity or when a relay differs.",
-    "quotaRetry is opt-in and supported only for provider-level openai-completions. Use narrow temporary-error substrings; maxRetries defaults to 3 and baseDelayMs to 2000."
   ]
 }

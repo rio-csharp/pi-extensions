@@ -73,10 +73,6 @@ function formatElapsed(milliseconds: number): string {
 	return `${(milliseconds / 1000).toFixed(1)}s`;
 }
 
-/**
- * Creates a self-shell renderer that displays one compact, timestamped tool
- * row and deliberately hides the result body.
- */
 export function createCompactRenderer(
 	name: string,
 	formatInvocation: (args: Record<string, any>, theme: Theme) => string,

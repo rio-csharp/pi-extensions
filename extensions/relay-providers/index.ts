@@ -1,18 +1,3 @@
-/**
- * relay-providers.ts — Static relay provider registration
- *
- * Loads the manually curated providers and models from
- * ~/.pi/agent/relay-providers.json. Providers or models with `hidden: true`
- * are kept in the config but not registered. Opening /model does not trigger
- * relay network requests or a second model-list update.
- *
- * Balance polling is owned by the separate relay-balance extension. Unknown
- * root/provider keys only produce warnings (never errors), so companion
- * extensions can share this config file.
- *
- * This file is the composition root: config.ts validates relay-providers.json
- * and streams.ts builds the pass-through/quota-retry streams.
- */
 
 import type { ExtensionAPI, ExtensionContext, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
 import { readFile } from "node:fs/promises";
@@ -61,7 +46,6 @@ function registerVisibleProviders(
 		if (provider.hidden === true) continue;
 
 		const visibleModels = provider.models.filter((model) => model.hidden !== true);
-		// Do not register an empty provider when every configured model is hidden.
 		if (visibleModels.length === 0) continue;
 
 		const api = provider.api ?? "openai-completions";
@@ -71,11 +55,8 @@ function registerVisibleProviders(
 			baseUrl: provider.baseUrl,
 			apiKey: provider.apiKey,
 			api: api as never,
-			// Preserve the OpenAI relay Bearer default without accidentally adding
-			// it to Azure, Codex, Anthropic, Google, Bedrock, or other API families.
 			authHeader: provider.authHeader ?? OPENAI_BEARER_APIS.has(api),
 			headers: provider.headers,
-			// Preserve the provider error body while redacting API-key-like tokens.
 			streamSimple: (quotaRetry
 				? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker)
 				: createPassThroughStream(api)) as never,
@@ -85,9 +66,7 @@ function registerVisibleProviders(
 }
 
 function unregisterManagedProviders(pi: ExtensionAPI, config: RelayConfig): void {
-	// Provider IDs are the ownership boundary in pi. Only unregister IDs that
-	// are explicitly declared in relay-providers.json; built-in providers and
-	// providers registered by other extensions under different IDs are untouched.
+	// Provider IDs are the ownership boundary: unregister only IDs declared in our config file.
 	for (const provider of config.providers) pi.unregisterProvider(provider.id);
 }
 
@@ -105,20 +84,14 @@ export default async function (pi: ExtensionAPI) {
 	try {
 		rawConfig = JSON.parse(configText) as unknown;
 	} catch {
-		// Do not print JSON.parse's source excerpt: it could include an API key or
-		// authorization header from the local file.
 		console.error(`[relay-providers] Invalid JSON in ${CONFIG_PATH}; check its JSON syntax.`);
 		return;
 	}
 
 	let config: RelayConfig;
 	try {
-		// Validate the entire shared local file, including hidden entries, before
-		// the first registerProvider call mutates the provider runtime.
 		const result = validateRelayConfig(rawConfig);
 		config = result.config;
-		// Unknown keys are warnings, not errors: companion extensions (e.g.
-		// relay-balance) own extra fields in this shared file, and typos stay visible.
 		for (const warning of result.warnings) console.warn(`[relay-providers] ${warning}`);
 	} catch (error) {
 		const reason = error instanceof Error ? error.message : "unknown validation error";
@@ -137,8 +110,6 @@ export default async function (pi: ExtensionAPI) {
 	pi.on("session_shutdown", (_event, ctx) => {
 		retryStatusTracker.clearAll();
 		sessionContext = undefined;
-		// ModelRuntime survives /reload and session replacement. The outgoing
-		// extension instance owns cleanup; the new instance registers only once.
 		unregisterManagedProviders(pi, config);
 	});
 }

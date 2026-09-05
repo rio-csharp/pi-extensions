@@ -67,7 +67,6 @@ test("project agent discovery stays within its explicit boundary and ignores esc
 		try {
 			symlinkSync(outside, join(childAgents, "escape.md"));
 		} catch {
-			// Windows may deny symlink creation; confinement is still covered where available.
 		}
 
 		const confined = discoverAgents(child, "project", child);

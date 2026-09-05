@@ -8,7 +8,6 @@ function formatElapsed(milliseconds: number): string {
 	return `${(milliseconds / 1000).toFixed(1)}s`;
 }
 
-/** Replaces Pi's generic Working row with observable model/tool stages. */
 export function registerWorkingStatus(pi: ExtensionAPI): void {
 	let ticker: ReturnType<typeof setInterval> | undefined;
 	let currentContext: ExtensionContext | undefined;

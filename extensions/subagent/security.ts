@@ -8,14 +8,12 @@ function isControlStringStart(codePoint: number): boolean {
 	return codePoint === 0x90 || codePoint === 0x98 || codePoint === 0x9d || codePoint === 0x9e || codePoint === 0x9f;
 }
 
-/** Remove ANSI/OSC/C0/C1 and bidi-spoofing controls from untrusted display text. */
 export function terminalSanitize(value: string): string {
 	let output = "";
 	for (let index = 0; index < value.length;) {
 		const codePoint = value.codePointAt(index)!;
 		const width = codePoint > 0xffff ? 2 : 1;
 
-		// ESC ]/P/X/^/_ and their C1 forms introduce terminal control strings.
 		if (codePoint === 0x1b && index + 1 < value.length && "]PX^_".includes(value[index + 1])) {
 			index += 2;
 			while (index < value.length) {
@@ -49,7 +47,6 @@ export function terminalSanitize(value: string): string {
 			continue;
 		}
 
-		// CSI (ESC [ or C1 CSI): consume parameters/intermediates through final byte.
 		if ((codePoint === 0x1b && value[index + 1] === "[") || codePoint === 0x9b) {
 			index += codePoint === 0x1b ? 2 : 1;
 			while (index < value.length) {
@@ -59,7 +56,6 @@ export function terminalSanitize(value: string): string {
 			continue;
 		}
 
-		// Other two-byte/intermediate ANSI escape sequences.
 		if (codePoint === 0x1b) {
 			index += 1;
 			while (index < value.length) {
@@ -84,7 +80,6 @@ export function terminalSanitize(value: string): string {
 	return output.replace(/ +/g, " ");
 }
 
-/** A terminal-safe, reversible representation suitable for an exact-path confirmation. */
 export function quoteExactPath(value: string): string {
 	let quoted = '"';
 	for (const char of value) {
@@ -102,7 +97,6 @@ export function quoteExactPath(value: string): string {
 }
 
 const BASE_ENV_NAMES = new Set([
-	// Process launch, OS account/directories, locale, TLS, and JS runtime.
 	"PATH", "PATHEXT", "SYSTEMROOT", "SYSTEMDRIVE", "WINDIR", "COMSPEC", "TEMP", "TMP", "TMPDIR",
 	"HOME", "USER", "USERNAME", "LOGNAME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH",
 	"APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "PROGRAMFILES", "PROGRAMFILES(X86)",
@@ -112,12 +106,10 @@ const BASE_ENV_NAMES = new Set([
 	"SSL_CERT_FILE", "SSL_CERT_DIR", "LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH", "NODE_OPTIONS", "NODE_PATH",
 	"NODE_EXTRA_CA_CERTS", "UV_THREADPOOL_SIZE", "BUN_INSTALL",
 
-	// Pi process configuration. Parent session/model metadata is intentionally absent.
 	"PI_CODING_AGENT", "PI_CODING_AGENT_DIR", "PI_CODING_AGENT_SESSION_DIR", "PI_PACKAGE_DIR",
 	"PI_OFFLINE", "PI_SKIP_VERSION_CHECK", "PI_TELEMETRY", "PI_CACHE_RETENTION",
 	"PI_SHARE_VIEWER_URL", "PI_HARDWARE_CURSOR", "PI_CLEAR_ON_SHRINK", "PI_EXPERIMENTAL",
 
-	// Network transport used by Pi/provider SDKs.
 	"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
 ]);
 
@@ -190,7 +182,6 @@ export function referencedEnvironmentNames(value: unknown): string[] {
 	return [...names];
 }
 
-/** Construct the deliberately small environment inherited by a child Pi. */
 export function buildChildEnvironment(
 	source: NodeJS.ProcessEnv = process.env,
 	provider?: string,

@@ -2,8 +2,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { terminalSanitize } from "./security.ts";
 import type { SingleResult, UsageStats } from "./types.ts";
 
-// Neutral convention: any extension status whose key starts with "footer-row-"
-// asks the active footer for a dedicated line. No footer-specific knowledge here.
+// Neutral convention: a "footer-row-" key asks the active footer for a dedicated line.
 const STATUS_KEY_PREFIX = "footer-row-subagent-";
 const STATUS_SUMMARY_KEY = `${STATUS_KEY_PREFIX}summary`;
 const STATUS_TICK_MS = 1000;
@@ -52,11 +51,6 @@ function formatModel(provider: string | undefined, model: string | undefined): s
 	return `${provider}/${model}`;
 }
 
-/**
- * Publishes live subagent state through setStatus(). It never owns the footer;
- * whichever footer is active remains responsible for rendering extension
- * statuses, and the "footer-row-" key prefix simply requests a dedicated line.
- */
 export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 	let nextRunId = 0;
 	let statusTimer: ReturnType<typeof setInterval> | undefined;
@@ -147,7 +141,6 @@ export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 			if (uiActive && runGeneration === lifecycleGeneration) {
 				ctx.ui.setStatus(statusKey(runId), undefined);
 				publishedStatusKeys.delete(statusKey(runId));
-				// Renumber visible labels and promote the next hidden subagent.
 				publishStatuses(ctx);
 			}
 			stopTimerIfIdle();

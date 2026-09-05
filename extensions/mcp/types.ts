@@ -28,7 +28,6 @@ export interface OAuthConfig {
   scope?: string;
 }
 
-/** Login state only: dynamic client registration plus the issued tokens. */
 export interface PersistedOAuthCredential {
   clientInformation?: OAuthClientInformationMixed;
   tokens?: OAuthTokens;
@@ -44,7 +43,6 @@ export interface MCPCredentials {
   mcpBearer: Record<string, PersistedBearerCredential>;
 }
 
-/** Initial connection info. This is exactly what gets written to mcp-config.json. */
 export interface MCPServerConfig {
   name: string;
   url: string;
@@ -56,7 +54,6 @@ export interface MCPServerConfig {
   oauthConfig?: OAuthConfig;
 }
 
-/** A configured server plus memory-only runtime state (never persisted). */
 export interface MCPServerRuntime extends MCPServerConfig {
   tools?: MCPTool[];
   resources?: MCPResource[];

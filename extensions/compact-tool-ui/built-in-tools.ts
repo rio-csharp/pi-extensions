@@ -109,7 +109,6 @@ function formatInvocation(name: ToolName, args: Record<string, any>, theme: Them
 	switch (name) {
 		case "bash":
 		case "powershell":
-			// Preserve command text for the shared renderer, which caps only its display.
 			return typeof args.command === "string" && args.command.length > 0 ? args.command : "...";
 
 		case "read": {

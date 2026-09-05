@@ -1,7 +1,3 @@
-/**
- * Loopback/private/link-local hostname checks shared by config validation and
- * the balance probe's request-time transport re-validation.
- */
 
 export function isPrivateIpv4(hostname: string): boolean {
 	const octets = hostname.split(".").map(Number);
@@ -23,8 +19,6 @@ export function isPrivateHttpHostname(hostname: string): boolean {
 	if (normalized === "localhost" || normalized.endsWith(".localhost")) return true;
 	if (isPrivateIpv4(normalized)) return true;
 
-	// URL normalizes IPv6 literals, so prefix checks are sufficient for loopback,
-	// RFC 4193 unique-local (fc00::/7), and RFC 4291 link-local (fe80::/10).
 	return normalized.includes(":") && (
 		normalized === "::1" ||
 		normalized.startsWith("fc") ||

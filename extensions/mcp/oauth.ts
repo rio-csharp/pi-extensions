@@ -40,7 +40,7 @@ export class InteractiveAuthorizationRequiredError extends UnauthorizedError {
 
 class PersistentOAuthProvider implements OAuthClientProvider {
   private expectedState?: string;
-  /** PKCE verifier only lives for a single in-session authorization flow. */
+
   private pendingCodeVerifier?: string;
 
   constructor(
@@ -136,7 +136,7 @@ class PersistentOAuthProvider implements OAuthClientProvider {
       this.pendingCodeVerifier = undefined;
       return;
     }
-    if (scope === "discovery") return; // discovery metadata is never persisted
+    if (scope === "discovery") return; 
     const credential = this.credential;
     if (!credential) return;
     if (scope === "all") delete this.store.credentials.mcpOAuth[this.key];

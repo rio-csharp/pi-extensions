@@ -44,7 +44,7 @@ export class McpConnectionManager {
     try {
       await connection.client.close();
     } catch {
-      try { await connection.transport.close(); } catch { /* already closed */ }
+      try { await connection.transport.close(); } catch { }
     }
   }
 
@@ -99,7 +99,7 @@ export class McpConnectionManager {
       }
       return { client, transport };
     } catch (error) {
-      try { await transport.close(); } catch { /* preserve original error */ }
+      try { await transport.close(); } catch { }
       throw error;
     } finally {
       this.pendingTransports.delete(transport);
@@ -165,7 +165,6 @@ export class McpRuntime {
     this.shuttingDown = false;
     this.store.initialize(ctx.cwd);
     await Promise.all([this.store.loadConfig(this.servers, ctx.isProjectTrusted()), this.store.loadCredentials()]);
-    // Tools are registered only after a live connection succeeds; nothing is cached on disk.
     for (const server of this.servers.values()) {
       if (server.enabled) this.connectInBackground(server, ctx);
     }

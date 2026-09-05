@@ -10,8 +10,6 @@ import { createHash } from "node:crypto";
 import type { MCPConnection, MCPServerRuntime, McpUiContext } from "./types.js";
 import { getErrorMessage, safeServerName, safeToolName, sanitizeTerminalText } from "./security.js";
 
-// ---------- Result formatting ----------
-
 export function normalizedMcpToolName(serverName: string, remoteName: string): string {
   return `mcp_${serverName}_${remoteName}`.replace(/[^a-zA-Z0-9_]/g, "_");
 }
@@ -77,8 +75,6 @@ function formatToolResult(result: any): string {
   if (result.structuredContent) lines.push(JSON.stringify(result.structuredContent, null, 2));
   return truncateRemoteOutput(lines.join("\n") || "MCP tool returned no content");
 }
-
-// ---------- Compact call rendering ----------
 
 interface CompactMcpRenderState {
   calledAt?: number;
@@ -197,8 +193,6 @@ export class CompactMcpRenderer {
     return JSON.stringify(value);
   }
 }
-
-// ---------- Tool registration ----------
 
 export class McpToolRegistry {
   private readonly registeredToolNames = new Map<string, Set<string>>();

@@ -6,8 +6,6 @@ import {
 	type Component,
 } from "@earendil-works/pi-tui";
 
-// Local structural subset of Pi's tool-render context. Keep it synchronized
-// with the Pi version supported by this extension.
 interface ToolRenderContext<TState, TArgs> {
 	args: TArgs;
 	toolCallId: string;
@@ -71,8 +69,6 @@ const ELLIPSIS = "...";
 
 function normalizeInvocation(invocation: string): string {
 	const normalized = invocation.replace(/\r\n|\r/g, "\n");
-	// String splitting creates one terminal empty artifact for a trailing newline.
-	// Remove only that artifact; any preceding empty line remains meaningful.
 	return normalized.endsWith("\n") ? normalized.slice(0, -1) : normalized;
 }
 
@@ -106,7 +102,6 @@ function capInvocationLines(
 	];
 }
 
-/** Width-aware invocation row capped after ANSI-safe wrapping. */
 export class CompactInvocationComponent implements Component {
 	private prefix = "";
 	private invocation = "";
@@ -125,7 +120,6 @@ export class CompactInvocationComponent implements Component {
 		if (this.cachedLines && this.cachedWidth === renderWidth) return this.cachedLines;
 
 		const { text, continuationIndent } = layoutInvocation(this.prefix, this.invocation);
-		// Match Text's tab display while taking control of its post-wrap line count.
 		const wrapped = wrapTextWithAnsi(text.replace(/\t/g, "   "), renderWidth);
 		const lines = capInvocationLines(wrapped, continuationIndent, renderWidth);
 
@@ -154,10 +148,6 @@ function formatElapsed(milliseconds: number): string {
 	return `${(milliseconds / 1000).toFixed(1)}s`;
 }
 
-/**
- * Creates a self-shell renderer that displays one compact, timestamped tool
- * row and deliberately hides the result body.
- */
 export function createCompactRenderer(
 	name: string,
 	formatInvocation: (args: Record<string, any>, theme: Theme) => string,

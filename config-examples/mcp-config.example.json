@@ -6,8 +6,7 @@
       "transport": "http",
       "scope": "user",
       "enabled": false,
-      "authType": "none",
-      "oauthConfig": {}
+      "authType": "none"
     }
   }
 }

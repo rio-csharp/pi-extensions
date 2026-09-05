@@ -14,7 +14,6 @@ const execFileAsync = promisify(execFile);
 
 type ServerMap = Map<string, MCPServerRuntime>;
 
-/** Pick only the initial connection info; runtime state (tools, resources, error, ...) stays memory-only. */
 function persistServer(server: MCPServerRuntime): MCPServerConfig {
   const persisted: MCPServerConfig = {
     name: server.name,

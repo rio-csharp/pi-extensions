@@ -1,16 +1,4 @@
-/**
- * Subagent Tool - Delegate tasks to specialized agents
- *
- * Spawns a separate `pi` process for each subagent invocation,
- * giving it an isolated context window.
- *
- * Supports three modes:
- *   - Single: { agent: "name", task: "..." }
- *   - Parallel: { tasks: [{ agent: "name", task: "..." }, ...] }
- *   - Chain: { chain: [{ agent: "name", task: "... {previous} ..." }, ...] }
- *
- * Uses RPC mode to capture structured output and steer running subagents.
- */
+
 
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -45,8 +33,8 @@ import type {
 } from "./types.ts";
 
 const UNLIMITED_CONCURRENCY = Number.POSITIVE_INFINITY;
-// The root pi process is depth 0. A subagent at depth 5 is a leaf and
-// cannot create more subagents, allowing five nested child levels.
+
+
 const MAX_SUBAGENT_DEPTH = 5;
 const SUBAGENT_DEPTH_ENV = "PI_SUBAGENT_DEPTH";
 const PER_TASK_OUTPUT_CAP = 50 * 1024;
@@ -96,7 +84,7 @@ function truncateUtf8(output: string, cap: number, suffixLabel: string): string 
 	return `${prefix}${suffix}`;
 }
 
-/** Best-effort removal of common credentials before text leaves runtime-only child state. */
+
 function redactSensitiveText(value: string): string {
 	return value
 		.replace(/-----BEGIN [^-]*PRIVATE KEY-----[\s\S]*?-----END [^-]*PRIVATE KEY-----/gi, "<private key redacted>")
@@ -300,10 +288,10 @@ async function runSingleAgent(
 	const args: string[] = ["--mode", "rpc"];
 	if (sessionId) args.push("--session-id", sessionId);
 	else args.push("--no-session");
-	// Callers pass the already resolved effective model. This also preserves the
-	// model selected when a persisted child session is resumed.
-	// `null` means a legacy persisted child whose original effective model was
-	// not recorded. Omit --model so Pi can restore it from the child session.
+
+
+
+
 	const selectedModel = inheritedModel === null ? undefined : inheritedModel ?? agent.model;
 	if (selectedModel) args.push("--model", selectedModel);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
@@ -434,14 +422,13 @@ async function runSingleAgent(
 					return;
 				}
 
-				// Headless subagents cannot service interactive extension dialogs. Cancel
-				// them explicitly so an RPC child never waits forever for a UI client.
+
+
 				if (event.type === "extension_ui_request") {
 					if (["select", "confirm", "input", "editor"].includes(event.method) && typeof event.id === "string") {
 						try {
 							writeRpcLine({ type: "extension_ui_response", id: event.id, cancelled: true });
 						} catch {
-							// Process shutdown will report the transport failure.
 						}
 					}
 					return;
@@ -525,8 +512,8 @@ async function runSingleAgent(
 			});
 
 			proc.on("error", (error) => {
-				// `close` follows both spawn failures and runtime process errors; let it
-				// perform the single cleanup/settlement path.
+
+
 				currentResult.stderr = appendBounded(
 					currentResult.stderr,
 					`${currentResult.stderr ? "\n" : ""}${terminalSanitize(redactSensitiveText(error.message))}`,
@@ -582,13 +569,11 @@ async function runSingleAgent(
 			try {
 				fs.unlinkSync(tmpPromptPath);
 			} catch {
-				/* ignore */
 			}
 		if (tmpPromptDir)
 			try {
 				fs.rmdirSync(tmpPromptDir);
 			} catch {
-				/* ignore */
 			}
 	}
 }
@@ -613,16 +598,16 @@ function selectedProvider(agents: AgentConfig[], agentName: string, ctx: Extensi
 
 function selectedProviderEnvironmentNames(provider: string | undefined, ctx: ExtensionContext): string[] {
 	if (!provider) return [];
-	// Registered provider API-key/header templates are the ambient inputs needed
-	// by user-defined relays. Provider env stored in auth.json is loaded directly
-	// by the child and therefore does not need ambient inheritance.
+
+
+
 	return referencedEnvironmentNames(ctx.modelRegistry.getRegisteredProviderConfig(provider));
 }
 
 export default function (pi: ExtensionAPI) {
-	// Subagents may recursively spawn children until the configured depth.
-	// At the maximum depth, this extension is not registered, making that
-	// process a leaf. PI_SUBAGENT_ACTIVE remains a marker for compatibility.
+
+
+
 	if (getSubagentDepth() >= MAX_SUBAGENT_DEPTH) return;
 
 	const { whileRunning } = createSubagentStatusPublisher(pi);
@@ -745,8 +730,8 @@ export default function (pi: ExtensionAPI) {
 			diagnosticBytes += Buffer.byteLength(diagnostic, "utf8");
 			results.push({
 				...result,
-				// Delegated prompts and child messages can contain source or credentials.
-				// They are unnecessary for background rendering and never enter details.
+
+
 				task: "[omitted from background details]",
 				messages: [],
 				stderr: hasErrorMessage ? "" : diagnostic,
@@ -1059,8 +1044,8 @@ export default function (pi: ExtensionAPI) {
 			if (job.completion) completions.push(job.completion);
 		}
 
-		// Persist interruption before aborting. Finalizers may then add task deltas
-		// while shutdown waits, but can never write after this lifecycle retires.
+
+
 		shuttingDown = true;
 		for (const job of activeJobs) job.controller?.abort();
 		for (const waiter of slotWaiters.splice(0)) {
@@ -1081,8 +1066,8 @@ export default function (pi: ExtensionAPI) {
 			job.status = "interrupted";
 			job.finishedAt ??= Date.now();
 			persistJobState(job);
-			// Retire this job even if other shutdown hooks start a replacement
-			// session before this hook returns.
+
+
 			job.runtimeGeneration = -1;
 		}
 		lifecycleGeneration++;
@@ -1239,10 +1224,10 @@ export default function (pi: ExtensionAPI) {
 					const step = params.chain[i];
 					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 
-					// Create update callback that includes all previous results
+
 					const chainUpdate: OnUpdateCallback | undefined = onUpdate
 						? (partial) => {
-								// Combine completed results with current streaming result
+
 								const currentResult = partial.details?.results[0];
 								if (currentResult) {
 									const allResults = [...results, currentResult];
@@ -1302,7 +1287,7 @@ export default function (pi: ExtensionAPI) {
 			if (params.tasks && params.tasks.length > 0) {
 				const allResults: SingleResult[] = new Array(params.tasks.length);
 
-				// Initialize placeholder results
+
 				for (let i = 0; i < params.tasks.length; i++) {
 					allResults[i] = {
 						agent: params.tasks[i].agent,
@@ -1348,7 +1333,7 @@ export default function (pi: ExtensionAPI) {
 									agents.find((agent) => agent.name === t.agent)?.model ?? getContextModel(ctx),
 									selectedProvider(agents, t.agent, ctx),
 									selectedProviderEnvironmentNames(selectedProvider(agents, t.agent, ctx), ctx),
-									// Per-task update callback
+
 									(partial) => {
 										if (partial.details?.results[0]) {
 											allResults[index] = partial.details.results[0];
@@ -1586,10 +1571,10 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			// ctx.isProjectTrusted() applies only to ctx.cwd and says nothing about
-			// an arbitrary cwd loaded from persisted job data. Pi exposes no
-			// arbitrary-path temporary/override trust query to extensions, so every
-			// project-agent resume requires an exact-path interactive approval.
+
+
+
+
 			if (job.agentScope !== "user") {
 				const executionPaths = [...new Set(job.tasks.map((task) => task.cwd ?? job.defaultCwd))];
 				const quotedExecutionPaths = executionPaths.map(quoteExactPath);

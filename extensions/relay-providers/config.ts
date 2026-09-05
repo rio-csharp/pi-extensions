@@ -1,13 +1,3 @@
-/**
- * Configuration types and strict validation for relay-providers.json.
- *
- * This is a trusted, user-local configuration. API keys and header values use
- * Pi's config-value syntax: $ENV_VAR interpolation and a leading !command are
- * resolved by Pi at request time. A command therefore intentionally runs with
- * the Pi process user's permissions; keep commands in this user-owned file,
- * never put a secret directly in the command text, and use $! for a literal
- * leading exclamation mark.
- */
 
 import { isPrivateHttpHostname } from "./net.ts";
 import { sanitizeTerminalText } from "./sanitize.ts";
@@ -25,7 +15,7 @@ const SUPPORTED_APIS = new Set([
 	"pi-messages",
 ]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const ROOT_KEYS = new Set(["providers", "_notes"]);
+const ROOT_KEYS = new Set(["providers"]);
 const PROVIDER_KEYS = new Set([
 	"id",
 	"hidden",
@@ -82,7 +72,6 @@ export interface RelayCostConfig extends RelayCostRates {
 
 export interface RelayModelConfig {
 	id: string;
-	/** Keep this model in the config without registering it. Default: false. */
 	hidden?: boolean;
 	api?: string;
 	baseUrl?: string;
@@ -93,7 +82,6 @@ export interface RelayModelConfig {
 	contextWindow?: number;
 	maxTokens?: number;
 	cost?: RelayCostConfig;
-	/** Values use the same trusted-local Pi config-value syntax as apiKey. */
 	headers?: Record<string, string>;
 	compat?: Record<string, unknown>;
 }
@@ -101,48 +89,28 @@ export interface RelayModelConfig {
 export interface QuotaRetryConfig {
 	maxRetries?: number;
 	baseDelayMs?: number;
-	/** "exponential" (default) doubles baseDelayMs each attempt; "fixed" always waits baseDelayMs. */
 	backoff?: "exponential" | "fixed";
-	/** When true, retry any pre-stream error regardless of its message text. */
 	matchAll?: boolean;
-	/** Case-insensitive literal substrings. No implicit regex interpretation. */
 	errorSubstrings?: string[];
 }
 
 export interface RelayProviderConfig {
 	id: string;
-	/** Keep this provider and all its models in the config without registering them. Default: false. */
 	hidden?: boolean;
 	name?: string;
 	baseUrl: string;
-	/** Pi config value: literal, $ENV_VAR interpolation, or intentional leading !command. */
 	apiKey: string;
 	api?: string;
-	/**
-	 * Required to opt into plain HTTP. Even when true, HTTP is accepted only for
-	 * localhost or literal loopback/private/link-local addresses. API keys and
-	 * headers sent this way are plaintext on that local/private network.
-	 */
 	allowInsecureHttp?: boolean;
 	authHeader?: boolean;
-	/** Values use the same trusted-local Pi config-value syntax as apiKey. */
 	headers?: Record<string, string>;
-	/** Defaults applied to every model; model compat values take precedence. */
 	compat?: Record<string, unknown>;
-	/**
-	 * Retry matching is explicitly opted in. `true` preserves the historical
-	 * matching of the two LEGACY_QUOTA_RETRY_ERROR_SUBSTRINGS above; use an
-	 * object with errorSubstrings to avoid retrying a provider's permanent
-	 * billing/quota-exhaustion message.
-	 */
 	quotaRetry?: boolean | QuotaRetryConfig;
 	models: RelayModelConfig[];
 }
 
 export interface RelayConfig {
 	providers: RelayProviderConfig[];
-	/** Documentation-only JSON footer used by the checked-in example. */
-	_notes?: string[];
 }
 
 export interface QuotaRetryOptions {
@@ -166,19 +134,12 @@ function isNonemptyString(value: unknown): value is string {
 function rejectUnknownKeys(value: JsonObject, allowed: ReadonlySet<string>, path: string, errors: string[]): void {
 	for (const key of Object.keys(value)) {
 		if (!allowed.has(key)) {
-			// Do not echo an attacker-controlled key: config errors reach the terminal,
-			// and a key can itself contain credentials or terminal control characters.
 			errors.push(`${path} contains an unsupported key`);
 		}
 	}
 }
 
-/**
- * Root/provider-level unknown keys are warnings, not errors: companion
- * extensions (e.g. relay-balance) own extra fields in this shared file, and a
- * hard error would couple this extension to every consumer's schema. The key
- * name is echoed (sanitized) so plain typos stay detectable.
- */
+// Root/provider-level unknown keys warn instead of failing: companion extensions own extra fields in this shared file.
 function warnUnknownKeys(value: JsonObject, allowed: ReadonlySet<string>, path: string, warnings: string[]): void {
 	for (const key of Object.keys(value)) {
 		if (!allowed.has(key)) {
@@ -239,8 +200,6 @@ function validateHeaders(value: unknown, path: string, errors: string[]): void {
 		return;
 	}
 	for (const [key, headerValue] of Object.entries(value)) {
-		// RFC 9110 field-name token. Avoid echoing configured names or values in
-		// errors, both to prevent log injection and to keep credential headers out.
 		if (!/^[!#$%&'*+.^_`|~0-9A-Za-z-]+$/.test(key)) {
 			errors.push(`${path} contains an invalid HTTP header name`);
 		}
@@ -249,9 +208,7 @@ function validateHeaders(value: unknown, path: string, errors: string[]): void {
 }
 
 function validateCompat(value: unknown, path: string, errors: string[]): void {
-	// Compat is Pi's documented forward-compatibility escape hatch. Keep the
-	// object open so newly installed Pi compat entries do not require an extension
-	// release; strict validation still applies to surrounding model/provider keys.
+	// Compat is pi's forward-compatibility escape hatch: keep the object open on purpose.
 	if (value !== undefined && !isObject(value)) errors.push(`${path} must be an object`);
 }
 
@@ -375,11 +332,6 @@ export function validateRelayConfig(value: unknown): { config: RelayConfig; warn
 		throw new Error("configuration root must be an object");
 	}
 	warnUnknownKeys(value, ROOT_KEYS, "configuration root", warnings);
-	if (value._notes !== undefined && (
-		!Array.isArray(value._notes) || value._notes.some((note) => typeof note !== "string")
-	)) {
-		errors.push("_notes must be an array of strings");
-	}
 	if (!Array.isArray(value.providers)) {
 		errors.push("providers must be an array");
 	}

@@ -215,8 +215,6 @@ export const subagentTimelineRenderer = {
 		if (options.isPartial) return context.lastComponent ?? new EmptyComponent();
 
 		const details = result.details as SubagentDetails | undefined;
-		// Background execution has its own completion timeline message. Keep only
-		// the original "subagent started" row when the start tool returns.
 		if (details?.background) return context.lastComponent ?? new EmptyComponent();
 
 		const state = context.state;
@@ -284,7 +282,6 @@ function formatTaskCounts(details: SubagentDetails | undefined): string {
 	return `${counts.succeeded} succeeded · ${counts.failed} failed · ${counts.pending} pending · ${counts.running} running`;
 }
 
-/** Render supervisor notifications as one compact row, regardless of Ctrl+O. */
 export function renderSubagentSupervisorMessage(message: any, theme: Theme): Component {
 	const details = message.details as SubagentDetails | undefined;
 	const finishedAt = details?.finishedAt ?? Date.now();
@@ -374,7 +371,6 @@ function updateJobsCall(
 	return state.callText;
 }
 
-/** Compact call/result renderer; Ctrl+O never reveals task output. */
 export const subagentJobsRenderer = {
 	renderShell: "self" as const,
 

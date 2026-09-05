@@ -38,7 +38,6 @@ export interface SubagentJobTaskDetails {
 	attempts: number;
 	completed: boolean;
 	model?: string;
-	/** Explicit supervisor state; optional for sessions persisted by older versions. */
 	state?: SubagentJobTaskState;
 }
 

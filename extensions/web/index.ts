@@ -1,14 +1,3 @@
-/**
- * Web tools extension
- *
- * Adds two LLM-callable tools backed by `curl` (no API key required):
- *   - web_search: keyless search via DuckDuckGo HTML endpoint
- *   - web_fetch:  fetch a URL and return readable, tag-stripped text
- *
- * Intended so (sub)agents can verify version-sensitive, security,
- * performance, or API facts against official documentation.
- */
-
 import {
 	DEFAULT_MAX_BYTES,
 	type ExtensionAPI,
@@ -30,6 +19,7 @@ const MAX_URL_LENGTH = 8192;
 const REQUEST_TIMEOUT_MS = 30_000;
 const MIN_CURL_VERSION = [8, 4, 0] as const;
 
+// SSRF guard: web_fetch must never reach loopback, private, or reserved addresses.
 const blockedIpv4 = new BlockList();
 for (const [network, prefix] of [
 	["0.0.0.0", 8],
@@ -139,10 +129,9 @@ function curlResolveArgs(url: URL, addresses: string[]): string[] {
 	const host = url.hostname.startsWith("[") && url.hostname.endsWith("]")
 		? url.hostname.slice(1, -1)
 		: url.hostname;
-	// A literal address is already authoritative. Avoid --resolve's IPv6-host syntax,
-	// which was not supported until curl 8.13.0.
 	if (isIP(host)) return [];
 	const pinnedAddresses = addresses.map((address) => isIP(address) === 6 ? `[${address}]` : address);
+	// Pin the DNS results in curl itself so a DNS-rebinding race cannot swap the address afterwards.
 	return ["--resolve", `${host}:${port}:${pinnedAddresses.join(",")}`];
 }
 
@@ -297,19 +286,16 @@ async function fetchPublic(
 
 function htmlToText(html: string): string {
 	let text = html;
-	// Drop non-content regions entirely.
 	text = text.replace(/<!--[\s\S]*?-->/g, " ");
 	text = text.replace(/<script[\s\S]*?<\/script>/gi, " ");
 	text = text.replace(/<style[\s\S]*?<\/style>/gi, " ");
 	text = text.replace(/<head[\s\S]*?<\/head>/gi, " ");
 	text = text.replace(/<noscript[\s\S]*?<\/noscript>/gi, " ");
 	text = text.replace(/<svg[\s\S]*?<\/svg>/gi, " ");
-	// Preserve some block structure as newlines.
 	text = text.replace(/<\/(p|div|section|article|li|tr|h[1-6]|pre|blockquote)>/gi, "\n");
 	text = text.replace(/<(br|hr)\s*\/?>/gi, "\n");
 	text = text.replace(/<li[^>]*>/gi, "- ");
 	text = decodeEntities(text.replace(/<[^>]+>/g, ""));
-	// Collapse whitespace but keep line breaks.
 	text = text.replace(/[ \t\f\v]+/g, " ");
 	text = text.replace(/ *\n */g, "\n");
 	text = text.replace(/\n{3,}/g, "\n\n");

@@ -3,23 +3,9 @@ import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
 
-/**
- * relay-balance: show the active relay provider's balance as a status.
- *
- * Looks up the current model's provider in ~/.pi/agent/relay-providers.json
- * (the file owned by the relay-providers extension), then polls
- * GET {baseUrl}/usage with the provider's apiKey and publishes the balance
- * (e.g. "$72.87") via setStatus under the "relay-balance" key. Only the
- * generic { remaining|balance, unit } response shape is supported; providers
- * not listed in the file (built-ins like kimi-coding) are ignored.
- *
- * Refreshes on session start, model switches, and a 5-minute timer.
- */
-
 const STATUS_KEY = "relay-balance";
 const CONFIG_PATH = join(process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent"), "relay-providers.json");
 
-/** Tolerant reader: relay-providers remains the strict validator of the file. */
 async function loadProvider(id: string): Promise<{ baseUrl: string; apiKey: string } | undefined> {
 	try {
 		const raw = JSON.parse(await readFile(CONFIG_PATH, "utf8")) as {
@@ -27,7 +13,7 @@ async function loadProvider(id: string): Promise<{ baseUrl: string; apiKey: stri
 		};
 		const p = raw.providers?.find(candidate => candidate.id === id);
 		if (typeof p?.baseUrl !== "string" || typeof p.apiKey !== "string") return undefined;
-		// $ENV_VAR is resolved; a leading !command is never executed here.
+		// $ENV_VAR is resolved; a leading !command is never executed by this probe.
 		const key = p.apiKey.startsWith("$") ? process.env[p.apiKey.slice(1)] : p.apiKey.startsWith("!") ? undefined : p.apiKey;
 		return key ? { baseUrl: p.baseUrl, apiKey: key } : undefined;
 	} catch {
@@ -61,7 +47,6 @@ async function refresh(ctx: ExtensionContext): Promise<void> {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", `${symbol}${amount.toFixed(2)}`));
 		}
 	} catch {
-		/* keep the previous status on network errors */
 	}
 }
 

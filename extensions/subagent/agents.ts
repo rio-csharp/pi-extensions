@@ -1,6 +1,3 @@
-/**
- * Agent discovery and configuration
- */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -68,7 +65,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", boundary: st
 		try {
 			parsed = parseFrontmatter<Record<string, unknown>>(content);
 		} catch {
-			// A malformed agent file must not prevent discovery of its siblings.
 			continue;
 		}
 		const { frontmatter, body } = parsed;
@@ -86,7 +82,6 @@ function loadAgentsFromDir(dir: string, source: "user" | "project", boundary: st
 		} else if (Array.isArray(frontmatter.tools) && frontmatter.tools.every((tool) => typeof tool === "string")) {
 			tools = frontmatter.tools.map((tool) => tool.trim()).filter(Boolean);
 		} else if (frontmatter.tools !== undefined) {
-			// Reject malformed values per-file instead of throwing on `.split()`.
 			continue;
 		}
 
@@ -120,7 +115,6 @@ function findProjectAgentsDir(cwd: string, projectBoundary: string | undefined):
 			try {
 				if (fs.statSync(canonicalCandidate).isDirectory()) return canonicalCandidate;
 			} catch {
-				// Keep searching toward the trusted boundary.
 			}
 		}
 		if (current === canonicalBoundary) break;

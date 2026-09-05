@@ -2,48 +2,22 @@ import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-cod
 import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-/**
- * compact-footer: compact single-line status footer (pure renderer).
- *
- * Renders `path/branch · context% · balance/usage · model` and performs no
- * network requests, provider registration, or config reads of its own.
- * Balance/usage text is published by other extensions through Pi's public
- * status API (`setStatus`); statuses whose keys are listed in
- * INLINE_STATUS_KEYS are rendered inline on the main line, every other
- * extension status is sanitized and shown on its own compact line below, and
- * statuses using the neutral DEDICATED_ROW_PREFIX convention each get a
- * dedicated line.
- *
- * The footer is reinstalled on every session_start so it always closes over a
- * live ctx (model/thinkingLevel/sessionManager getters stay current after
- * reload/resume).
- */
-
-/** Status keys rendered inline between the context percentage and the model. */
 const INLINE_STATUS_KEYS = new Set(["relay-balance", "kimi-usage"]);
-/** Neutral convention: any extension status with this key prefix gets its own line. */
 const DEDICATED_ROW_PREFIX = "footer-row-";
 const MAX_LABEL_LENGTH = 48;
 
-/** Remove terminal string controls as a whole, including unterminated forms. */
 function stripTerminalStrings(value: string): string {
 	return value
-		// OSC (BEL or ST terminated), including its C1 form.
 		.replace(/(?:\x1B\]|\x9D)[\s\S]*?(?:\x07|\x1B\\|\x9C|$)/g, "")
-		// DCS, SOS, PM and APC (ST terminated), including their C1 forms.
 		.replace(/(?:\x1B[P_X^]|[\x90\x98\x9E\x9F])[\s\S]*?(?:\x1B\\|\x9C|$)/g, "");
 }
 
-/** Strip terminal control sequences/characters before untrusted text reaches the TUI. */
 function sanitizeExternalText(value: string, maxLength: number): string {
 	const withoutSequences = stripTerminalStrings(value)
-		// CSI and remaining ESC sequences, including incomplete trailing CSI.
 		.replace(/(?:\x1B\[|\x9B)[0-?]*[ -/]*[@-~]/g, "")
 		.replace(/(?:\x1B\[|\x9B)[0-?]*[ -/]*$/g, "")
 		.replace(/\x1B[ -/]*[@-~]/g, "")
 		.replace(/[\x00-\x1F\x7F-\x9F]/g, " ")
-		// Bidi marks, embeddings, overrides, isolates and deprecated isolates can
-		// visually reorder terminal output even though they are printable Unicode.
 		.replace(/[\u061C\u200E\u200F\u202A-\u202E\u2066-\u206F]/g, "")
 		.replace(/\s+/g, " ")
 		.trim();
@@ -70,9 +44,8 @@ function formatCwdForFooter(cwd: string, home: string | undefined): string {
 	return relativeToHome === "" ? "~" : `~${sep}${relativeToHome}`;
 }
 
+// Statuses can contain network/extension text: keep only pi theme SGR codes, sanitize every plain segment.
 function sanitizeStatusText(text: string): string {
-	// These values can include extension/network text. Preserve only SGR color
-	// codes produced by Pi's theme; sanitize every plain segment fully.
 	const sgr = /\x1B\[[0-9;]*m/g;
 	let result = "";
 	let offset = 0;
@@ -85,10 +58,6 @@ function sanitizeStatusText(text: string): string {
 	return result.trim();
 }
 
-/**
- * Single-line footer: path/branch · context% · inline statuses · model.
- * Skips cumulative ↑/↓/cache/cost token stats.
- */
 function installBalanceFooter(ctx: ExtensionContext): void {
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		const unsub = footerData.onBranchChange(() => tui.requestRender());
@@ -101,9 +70,7 @@ function installBalanceFooter(ctx: ExtensionContext): void {
 				const contextUsage = ctx.getContextUsage();
 				const contextWindow = contextUsage?.contextWindow ?? model?.contextWindow ?? 0;
 				const reportedContextPercent = contextUsage?.percent;
-				// Provider usage can briefly report the pre-compaction prompt after Pi
-				// has compacted the session. Treat impossible values as unknown instead
-				// of rendering a misleading percentage above 100%.
+				// After compaction the provider can briefly report the pre-compaction prompt; treat impossible values as unknown.
 				const contextPercentIsValid =
 					reportedContextPercent !== null &&
 					reportedContextPercent !== undefined &&
@@ -177,14 +144,12 @@ function installBalanceFooter(ctx: ExtensionContext): void {
 					}
 				}
 
-				// Dim path/balance; keep context color codes intact by dimming the plain prefix only.
+				// Dim plain segments only, so the context-percentage colors survive.
 				const dimStatsLeft = theme.fg("dim", statsLeft);
 				const remainder = statsLine.slice(statsLeft.length);
 				const dimRemainder = theme.fg("dim", remainder);
 				const lines = [dimStatsLeft + dimRemainder];
 
-				// Keep ordinary extension statuses compact; statuses opting into the
-				// dedicated-row convention each render on their own line below.
 				const statusEntries = Array.from(extensionStatuses.entries())
 					.filter(([key]) => !INLINE_STATUS_KEYS.has(key))
 					.sort(([a], [b]) => a.localeCompare(b));
