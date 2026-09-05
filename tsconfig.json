@@ -12,7 +12,9 @@
   "include": [
     "extensions/compact-tool-ui/**/*.ts",
     "extensions/mcp/**/*.ts",
-    "extensions/relay-footer/**/*.ts",
+    "extensions/compact-footer/**/*.ts",
+    "extensions/kimi-usage/**/*.ts",
+    "extensions/relay-balance/**/*.ts",
     "extensions/relay-providers/**/*.ts",
     "extensions/subagent/**/*.ts",
     "extensions/web/**/*.ts"

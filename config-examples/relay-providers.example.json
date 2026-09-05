@@ -21,7 +21,6 @@
           "temporary quota allocation unavailable"
         ]
       },
-      "balanceEnabled": false,
       "models": [
         {
           "id": "your-model-id",

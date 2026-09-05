@@ -27,17 +27,25 @@ The web tools apply destination and transfer-size safeguards. Search queries and
 
 Runs specialized subagents in isolated Pi subprocesses with background supervision enabled by default. A call returns a job ID immediately; completion or interruption is delivered automatically, and `subagent_jobs` can steer running children or list, inspect, cancel, and resume persisted child sessions. Synchronous execution remains available with `background: false`.
 
-Live progress is published through `setStatus()` and includes the agent name, active model, elapsed time, token usage, and cost. The extension does not call `setFooter()`, remains compatible with `relay-footer`, and uses the `subagent-status-*` status-key prefix. See [`extensions/subagent/README.md`](./extensions/subagent/README.md) for modes, limits, and security details.
+Live progress is published through `setStatus()` and includes the agent name, active model, elapsed time, token usage, and cost. The extension does not call `setFooter()`, remains compatible with `compact-footer`, and uses the `subagent-status-*` status-key prefix. See [`extensions/subagent/README.md`](./extensions/subagent/README.md) for modes, limits, and security details.
 
-### `relay-footer`
+### `compact-footer`
 
-Shows balance/quota information in a compact footer using built-in and locally configured adapters. Configured generic/Rix checks are opt-in, and the built-in Kimi check has a local opt-out. When enabled for the active provider, an adapter sends resolved authentication to that provider's documented usage endpoint.
+Renders a compact single-line footer (`path/branch · context% · balance/usage · model`). It is a pure renderer: it performs no network requests and reads no provider configuration. Balance/usage text is published by `relay-balance` and `kimi-usage` through Pi's public status API and rendered inline; every other extension status is sanitized and shown on its own line below.
 
 ### `relay-providers`
 
-Registers manually configured providers and models from the user's local `relay-providers.json`; entries can be kept hidden, and compatible relays can opt into bounded, cancelable pre-output quota retries.
+Registers manually configured providers and models from the user's local `relay-providers.json`; entries can be kept hidden, and compatible relays can opt into bounded, cancelable pre-output quota retries. It owns the shared config file: unknown root/provider keys only produce warnings, so companion extensions (such as `relay-balance`) can define their own fields in the same file.
 
 The repository contains no user relay-provider IDs, endpoints, model catalogs, or credential values. The checked-in example is provider-neutral.
+
+### `relay-balance`
+
+Companion to `relay-providers`: looks up the active model's provider in the same `relay-providers.json`, polls `GET {baseUrl}/usage` with its apiKey, and publishes the balance (e.g. `$72.87`) via `setStatus()` under the `relay-balance` key for compact-footer. Only the generic `{ remaining|balance, unit }` response shape is supported; refreshes happen on session start, model switches, and a 5-minute timer.
+
+### `kimi-usage`
+
+Polls the official usage endpoint of Pi's built-in `kimi-coding` provider and publishes 5-hour/weekly usage percentages via `setStatus()` for compact-footer to render inline. The credential is resolved through Pi's built-in auth (`auth.json` OAuth/api key or `KIMI_API_KEY`), and refreshes happen on session start, model switches, and throttled post-agent polls.
 
 ### `mcp`
 
@@ -185,7 +193,7 @@ Copy-Item .\config-examples\relay-providers.example.json "$HOME\.pi\agent\relay-
 
 Set the referenced environment variable (for example `YOUR_PROVIDER_API_KEY`) or replace the placeholder locally. Prefer environment-variable references over literal credentials. The real `relay-providers.json` must never be committed.
 
-Enable balance checks only for providers whose authenticated usage endpoint you intend to query. Generic/Rix checks require an explicit local opt-in; the built-in Kimi check can be disabled locally without affecting model registration. Compatible OpenAI-style relays can also opt into bounded quota retries, which occur only before output starts and remain cancelable. See the provider-neutral examples for the available fields. Do not add real credentials to this repository.
+Balance checks are handled by the separate `relay-balance` extension (generic `GET {baseUrl}/usage` probes against providers from the local config). Compatible OpenAI-style relays can also opt into bounded quota retries, which occur only before output starts and remain cancelable. See the provider-neutral examples for the available fields. Do not add real credentials to this repository.
 
 ### MCP
 
@@ -211,8 +219,8 @@ Each extension is self-contained:
 - `web` has its own renderer.
 - `subagent` has its own timeline, background supervisor, job-management tool, and status publisher.
 - No extension imports another extension's source files.
-- `relay-footer` and `subagent` communicate only through Pi's public status API: `setStatus()`.
-- Relay extensions contain no user relay-provider configuration; the footer also includes explicitly documented built-in balance adapters.
+- `compact-footer` is a pure footer renderer; `relay-balance`, `kimi-usage`, and `subagent` communicate with it only through Pi's public status API: `setStatus()`.
+- Relay extensions contain no user relay-provider configuration; built-in balance/usage adapters are explicitly documented.
 
 You can copy, remove, or modify any extension independently.
 
@@ -223,8 +231,10 @@ You can copy, remove, or modify any extension independently.
 | `compact-tool-ui` | Changes tool rendering | Overrides built-in tool definitions |
 | `web` | Performs bounded public-web requests | Sends search queries/URLs to remote services and applies destination safeguards |
 | `subagent` | Starts and supervises Pi subprocesses | Child agents inherit local permissions; background jobs can be resumed |
-| `relay-footer` | Queries enabled provider usage adapters | Sends resolved credentials to the provider's usage endpoint |
+| `compact-footer` | Renders the compact status footer | No network access; sanitizes statuses published by other extensions |
 | `relay-providers` | Registers models/providers from local config | Changes the active provider registry; opt-in retries may repeat a request before output starts |
+| `relay-balance` | Polls the active relay's balance endpoint | Sends the provider's resolved API key to its `/usage` endpoint |
+| `kimi-usage` | Queries the built-in Kimi usage endpoint | Sends provider-scoped Kimi credentials to the official Kimi usage endpoint |
 | `mcp` | Connects remote MCP servers | Remote tools may perform actions |
 
 ## Private configuration policy

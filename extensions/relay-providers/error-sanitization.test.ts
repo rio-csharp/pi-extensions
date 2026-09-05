@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { redactRelayErrorText } from "./index.ts";
+import { redactRelayErrorText } from "./sanitize.ts";
 
 test("redacts OpenAI-style API-key tokens in relay errors", () => {
 	const apiKey = ["sk", "proj", "1234567890abcdef"].join("-");

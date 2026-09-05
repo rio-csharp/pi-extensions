@@ -95,7 +95,7 @@ The conversation is intentionally quiet and acts as a timeline:
 [18:41:05] ✓ subagent completed · Review authentication · reviewer · 53.2s · 4 turns · ↑8.0k ↓1.3k R3.0k W0 · $0.0214
 ```
 
-While work is running, the extension publishes status entries with `ctx.ui.setStatus()`. The active footer (such as `relay-footer`) remains the sole footer renderer and shows the live details:
+While work is running, the extension publishes status entries with `ctx.ui.setStatus()`. Status keys carry the neutral `footer-row-` prefix, which asks the active footer to give each running subagent a dedicated line with the live details:
 
 - Status title and agent name
 - Active model (the agent's configured model, or the inherited parent model)

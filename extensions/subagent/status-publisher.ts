@@ -2,7 +2,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { terminalSanitize } from "./security.ts";
 import type { SingleResult, UsageStats } from "./types.ts";
 
-const STATUS_KEY_PREFIX = "subagent-status-";
+// Neutral convention: any extension status whose key starts with "footer-row-"
+// asks the active footer for a dedicated line. No footer-specific knowledge here.
+const STATUS_KEY_PREFIX = "footer-row-subagent-";
 const STATUS_SUMMARY_KEY = `${STATUS_KEY_PREFIX}summary`;
 const STATUS_TICK_MS = 1000;
 const MAX_STATUS_ROWS = 5;
@@ -52,8 +54,8 @@ function formatModel(provider: string | undefined, model: string | undefined): s
 
 /**
  * Publishes live subagent state through setStatus(). It never owns the footer;
- * whichever footer is active (for example relay-footer) remains responsible
- * for rendering extension statuses.
+ * whichever footer is active remains responsible for rendering extension
+ * statuses, and the "footer-row-" key prefix simply requests a dedicated line.
  */
 export function createSubagentStatusPublisher(pi: ExtensionAPI) {
 	let nextRunId = 0;
