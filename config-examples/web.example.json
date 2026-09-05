@@ -1,0 +1,11 @@
+{
+  "searchProviders": [
+    { "id": "searxng", "endpoint": "https://searxng.example.com", "basicAuth": "$SEARXNG_AUTH" },
+    "duckduckgo",
+    "bing"
+  ],
+  "fetchRelay": {
+    "endpoint": "https://fetch-relay.example.com",
+    "token": "$FETCH_RELAY_TOKEN"
+  }
+}
