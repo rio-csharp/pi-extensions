@@ -288,8 +288,12 @@ function validateQuotaRetry(value: unknown, providerApi: unknown, path: string, 
 		errors.push(`${path} must be a boolean or retry-options object`);
 		return;
 	}
-	if (providerApi !== undefined && providerApi !== "openai-completions") {
-		errors.push(`${path} is supported only when the provider API is "openai-completions"`);
+	if (
+		providerApi !== undefined &&
+		providerApi !== "openai-completions" &&
+		providerApi !== "openai-responses"
+	) {
+		errors.push(`${path} is supported only when the provider API is "openai-completions" or "openai-responses"`);
 	}
 	if (value === true) return;
 

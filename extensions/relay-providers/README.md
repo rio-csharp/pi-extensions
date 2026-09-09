@@ -8,7 +8,7 @@ The config file is local-only — never commit it. See [config-examples](../../c
 
 Per provider: `id`, `baseUrl`, `apiKey` (literal, `$ENV_VAR`, or a trusted local `!command`), `api` (a built-in pi API family such as `openai-completions` or `openai-responses`), and `models[]`. `hidden: true` on a provider or model keeps it in the file without registering it.
 
-Optional `quotaRetry` (only for `openai-completions` providers) retries matching failures that happen before output starts, with fixed or exponential backoff; the wait is shown as a status and Esc cancels it.
+Optional `quotaRetry` (for `openai-completions` and `openai-responses` providers) retries matching failures that happen before output starts, with fixed or exponential backoff; the wait is shown as a status and Esc cancels it.
 
 ## Notes
 

@@ -49,7 +49,7 @@ function registerVisibleProviders(
 		if (visibleModels.length === 0) continue;
 
 		const api = provider.api ?? "openai-completions";
-		const quotaRetry = api === "openai-completions" ? normalizeQuotaRetry(provider.quotaRetry) : undefined;
+		const quotaRetry = normalizeQuotaRetry(provider.quotaRetry);
 		pi.registerProvider(provider.id, {
 			name: provider.name ?? provider.id,
 			baseUrl: provider.baseUrl,
