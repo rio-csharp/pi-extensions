@@ -82,8 +82,10 @@ export class McpConnectionManager {
 
   async connectRaw(server: MCPServerConfig, authProvider?: OAuthClientProvider): Promise<MCPConnection> {
     const headers: Record<string, string> = {};
-    const bearerToken = this.store.getBearerToken(server);
-    if (server.authType === "bearer" && bearerToken) headers.Authorization = `Bearer ${bearerToken}`;
+    if (server.authType === "bearer") {
+      const authorization = this.store.getBearerAuthorization(server);
+      if (authorization) headers.Authorization = authorization;
+    }
     const transport = new StreamableHTTPClientTransport(parseMcpUrl(server.url), {
       authProvider,
       fetch: safeFetch,

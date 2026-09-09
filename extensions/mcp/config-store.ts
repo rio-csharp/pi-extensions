@@ -14,6 +14,8 @@ const execFileAsync = promisify(execFile);
 
 type ServerMap = Map<string, MCPServerRuntime>;
 
+const AUTHORIZATION_SCHEME_PATTERN = /^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]{0,31}$/;
+
 function persistServer(server: MCPServerRuntime): MCPServerConfig {
   const persisted: MCPServerConfig = {
     name: server.name,
@@ -24,6 +26,7 @@ function persistServer(server: MCPServerRuntime): MCPServerConfig {
   };
   if (server.authType !== undefined) persisted.authType = server.authType;
   if (server.bearerTokenEnv !== undefined) persisted.bearerTokenEnv = server.bearerTokenEnv;
+  if (server.bearerScheme !== undefined) persisted.bearerScheme = server.bearerScheme;
   if (server.oauthConfig !== undefined) persisted.oauthConfig = server.oauthConfig;
   return persisted;
 }
@@ -55,6 +58,15 @@ export class McpConfigStore {
   getBearerToken(server: MCPServerConfig): string | undefined {
     const envToken = server.bearerTokenEnv ? process.env[server.bearerTokenEnv] : undefined;
     return envToken?.trim() || this.credentials.mcpBearer[this.credentialKey(server)]?.token;
+  }
+
+  /** Full Authorization header value: credential tokenType > configured bearerScheme > "Bearer". */
+  getBearerAuthorization(server: MCPServerConfig): string | undefined {
+    const envToken = server.bearerTokenEnv ? process.env[server.bearerTokenEnv]?.trim() : undefined;
+    if (envToken) return `${server.bearerScheme ?? "Bearer"} ${envToken}`;
+    const credential = this.credentials.mcpBearer[this.credentialKey(server)];
+    if (!credential) return undefined;
+    return `${credential.tokenType ?? server.bearerScheme ?? "Bearer"} ${credential.token}`;
   }
 
   async loadCredentials(): Promise<void> {
@@ -108,6 +120,9 @@ export class McpConfigStore {
     if (server.bearerTokenEnv && !/^[A-Za-z_][A-Za-z0-9_]*$/.test(server.bearerTokenEnv)) {
       throw new Error(`Invalid bearerTokenEnv for ${key}`);
     }
+    if (server.bearerScheme !== undefined && !AUTHORIZATION_SCHEME_PATTERN.test(server.bearerScheme)) {
+      throw new Error(`Invalid bearerScheme for ${key}`);
+    }
     return server;
   }
 
@@ -157,8 +172,12 @@ export class McpConfigStore {
     const result: MCPCredentials["mcpBearer"] = {};
     if (!value || typeof value !== "object" || Array.isArray(value)) return result;
     for (const [key, credential] of Object.entries(value)) {
-      const token = (credential as MCPCredentials["mcpBearer"][string])?.token;
-      if (typeof token === "string" && token) result[key] = { token };
+      const { token, tokenType } = (credential ?? {}) as MCPCredentials["mcpBearer"][string];
+      if (typeof token !== "string" || !token) continue;
+      result[key] = {
+        token,
+        ...(typeof tokenType === "string" && AUTHORIZATION_SCHEME_PATTERN.test(tokenType) ? { tokenType } : {}),
+      };
     }
     return result;
   }

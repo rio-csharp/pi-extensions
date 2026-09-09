@@ -29,7 +29,7 @@ function displayHelp(ctx: McpUiContext): void {
   ctx.ui.notify(
     "MCP commands:\n" +
     "  /mcp list [--details]\n" +
-    "  /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>] [--bearer-token-env <ENV_VAR>]\n" +
+    "  /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>] [--bearer-token-env <ENV_VAR>] [--bearer-scheme <SCHEME>]\n" +
     "  /mcp remove <name>\n" +
     "  /mcp enable|disable <name>\n" +
     "  /mcp connect <name>\n" +
@@ -65,17 +65,19 @@ async function handleAdd(runtime: McpRuntime, parts: string[], ctx: McpUiContext
   let authType: "none" | "oauth" | "bearer" = "none";
   let oauthScope: string | undefined;
   let bearerTokenEnv: string | undefined;
+  let bearerScheme: string | undefined;
   const positional: string[] = [];
   let parseError: string | undefined;
   for (let index = 1; index < parts.length; index++) {
     const part = parts[index];
-    if (["--transport", "--scope", "--auth", "--oauth-scope", "--bearer-token-env"].includes(part)) {
+    if (["--transport", "--scope", "--auth", "--oauth-scope", "--bearer-token-env", "--bearer-scheme"].includes(part)) {
       const value = parts[++index];
       if (!value) { parseError = `Missing value for ${part}`; break; }
       if (part === "--transport") transport = value as "http" | "stdio";
       else if (part === "--scope") scope = value as "user" | "project";
       else if (part === "--auth") authType = value as "none" | "oauth" | "bearer";
       else if (part === "--oauth-scope") oauthScope = value;
+      else if (part === "--bearer-scheme") bearerScheme = value;
       else bearerTokenEnv = value;
     } else if (part.startsWith("--")) { parseError = `Unknown option: ${part}`; break; }
     else positional.push(part);
@@ -83,10 +85,11 @@ async function handleAdd(runtime: McpRuntime, parts: string[], ctx: McpUiContext
   const [name, url, ...extra] = positional;
   const validAuthType = ["none", "oauth", "bearer"].includes(authType);
   const validEnv = !bearerTokenEnv || /^[A-Za-z_][A-Za-z0-9_]*$/.test(bearerTokenEnv);
+  const validScheme = !bearerScheme || /^[A-Za-z][A-Za-z0-9!#$%&'*+.^_`|~-]{0,31}$/.test(bearerScheme);
   const validOAuthScope = !oauthScope || /^[\x21\x23-\x5B\x5D-\x7E]{1,2048}$/.test(oauthScope);
-  if (parseError || transport !== "http" || !["user", "project"].includes(scope ?? "") || !validAuthType || !validEnv || !validOAuthScope ||
-      !name || !url || extra.length > 0 || (bearerTokenEnv && authType !== "bearer") || (authType === "bearer" && !bearerTokenEnv) || (oauthScope && authType !== "oauth")) {
-    ctx.ui.notify(`${parseError ? `${parseError}\n` : ""}Usage: /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>] [--oauth-scope <scope>] [--bearer-token-env <ENV_VAR>]`, "error");
+  if (parseError || transport !== "http" || !["user", "project"].includes(scope ?? "") || !validAuthType || !validEnv || !validOAuthScope || !validScheme ||
+      !name || !url || extra.length > 0 || (bearerTokenEnv && authType !== "bearer") || (bearerScheme && authType !== "bearer") || (authType === "bearer" && !bearerTokenEnv) || (oauthScope && authType !== "oauth")) {
+    ctx.ui.notify(`${parseError ? `${parseError}\n` : ""}Usage: /mcp add --transport http --scope <user|project> <name> <url> [--auth <none|oauth|bearer>] [--oauth-scope <scope>] [--bearer-token-env <ENV_VAR>] [--bearer-scheme <SCHEME>]`, "error");
     return;
   }
   try { parseMcpUrl(url); } catch (error) { ctx.ui.notify(`Invalid MCP URL: ${getErrorMessage(error)}`, "error"); return; }
@@ -99,7 +102,7 @@ async function handleAdd(runtime: McpRuntime, parts: string[], ctx: McpUiContext
   if (scope === "project" && !ctx.isProjectTrusted()) {
     ctx.ui.notify("Project-scoped MCP servers require a trusted project", "error"); return;
   }
-  const server: MCPServerConfig = { name, url, transport, scope: scope!, enabled: true, authType, bearerTokenEnv, oauthConfig: authType === "oauth" ? { scope: oauthScope } : undefined };
+  const server: MCPServerConfig = { name, url, transport, scope: scope!, enabled: true, authType, bearerTokenEnv, bearerScheme, oauthConfig: authType === "oauth" ? { scope: oauthScope } : undefined };
   try {
     const result = await runtime.addServer(server, ctx);
     ctx.ui.notify(`Added ${safeServerName(server)}: ${result.tools} tools, ${result.resources} resources`, "info");

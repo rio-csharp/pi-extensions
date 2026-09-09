@@ -18,4 +18,5 @@ cd extensions/mcp && npm ci --omit=dev
 
 - Use the `/mcp` command to manage servers and start OAuth flows
 - OAuth tokens are stored in `~/.pi/agent/.credentials.json`
+- Bearer tokens are read from the env var given by `--bearer-token-env`, or from `mcpBearer` in `~/.pi/agent/.credentials.json` as `{ "<name>|<url-hash>": { "token": "...", "tokenType": "Bearer" } }`. `tokenType` is the Authorization scheme and defaults to `"Bearer"`; servers with a non-standard scheme (e.g. eudic's `NIS`) can also set `"bearerScheme"` in `mcp-config.json`, which applies to env-var tokens and as a fallback
 - Remote server responses are sanitized before they reach the UI

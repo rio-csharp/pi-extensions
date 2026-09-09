@@ -36,6 +36,8 @@ export interface PersistedOAuthCredential {
 
 export interface PersistedBearerCredential {
   token: string;
+  /** Authorization scheme sent with the token (default "Bearer"), e.g. "NIS" for eudic */
+  tokenType?: string;
 }
 
 export interface MCPCredentials {
@@ -51,6 +53,8 @@ export interface MCPServerConfig {
   enabled: boolean;
   authType?: "none" | "oauth" | "bearer";
   bearerTokenEnv?: string;
+  /** Authorization scheme for bearer auth (default "Bearer"), e.g. "NIS" for eudic */
+  bearerScheme?: string;
   oauthConfig?: OAuthConfig;
 }
 
