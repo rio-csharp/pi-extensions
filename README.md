@@ -6,6 +6,7 @@ Standalone extensions for the [pi coding agent](https://github.com/earendil-work
 
 - [compact-footer](extensions/compact-footer/) — one-line status footer (pure renderer)
 - [compact-tool-ui](extensions/compact-tool-ui/) — compact tool-call and thinking rendering
+- [keep-model-on-new](extensions/keep-model-on-new/) — carries the active model into `/new` sessions
 - [kimi-usage](extensions/kimi-usage/) — built-in Kimi usage percentages as a status
 - [mcp](extensions/mcp/) — remote Streamable HTTP MCP servers
 - [relay-balance](extensions/relay-balance/) — active relay provider's balance as a status
