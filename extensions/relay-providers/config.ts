@@ -15,7 +15,7 @@ const SUPPORTED_APIS = new Set([
 	"pi-messages",
 ]);
 const THINKING_LEVELS = new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max"]);
-const ROOT_KEYS = new Set(["providers"]);
+const ROOT_KEYS = new Set(["providers", "catalogFilters"]);
 const PROVIDER_KEYS = new Set([
 	"id",
 	"hidden",
@@ -111,6 +111,8 @@ export interface RelayProviderConfig {
 
 export interface RelayConfig {
 	providers: RelayProviderConfig[];
+	/** Built-in catalog provider ID -> model IDs to keep; all other models of that provider are hidden. */
+	catalogFilters?: Record<string, string[]>;
 }
 
 export interface QuotaRetryOptions {
@@ -408,6 +410,35 @@ export function validateRelayConfig(value: unknown): { config: RelayConfig; warn
 			validateHeaders(model.headers, `${modelPath}.headers`, errors);
 			validateCompat(model.compat, `${modelPath}.compat`, errors);
 			validateThinkingLevelMap(model.thinkingLevelMap, `${modelPath}.thinkingLevelMap`, errors);
+		}
+	}
+
+	if (value.catalogFilters !== undefined) {
+		if (!isObject(value.catalogFilters)) {
+			errors.push("catalogFilters must be an object mapping built-in provider IDs to kept model ID arrays");
+		} else {
+			for (const [providerId, keepModels] of Object.entries(value.catalogFilters)) {
+				const filterPath = `catalogFilters.${sanitizeTerminalText(providerId, 64)}`;
+				if (!isNonemptyString(providerId)) {
+					errors.push("catalogFilters keys must be nonempty provider IDs");
+				} else if (providerIds.has(providerId)) {
+					errors.push(`${filterPath} targets a relay provider owned by this file; use "hidden" on that provider or its models instead`);
+				}
+				if (!Array.isArray(keepModels) || keepModels.length === 0) {
+					errors.push(`${filterPath} must be a nonempty array of model IDs to keep`);
+					continue;
+				}
+				const seenKeepIds = new Set<string>();
+				for (let index = 0; index < keepModels.length; index++) {
+					if (!isNonemptyString(keepModels[index])) {
+						errors.push(`${filterPath}[${index}] must be a nonempty string`);
+					} else if (seenKeepIds.has(keepModels[index])) {
+						errors.push(`${filterPath}[${index}] duplicates another model ID`);
+					} else {
+						seenKeepIds.add(keepModels[index]);
+					}
+				}
+			}
 		}
 	}
 

@@ -1,4 +1,7 @@
 {
+  "catalogFilters": {
+    "some-builtin-provider": ["model-id-to-keep", "another-model-id-to-keep"]
+  },
   "providers": [
     {
       "id": "your-provider-id",

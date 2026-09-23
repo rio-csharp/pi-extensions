@@ -15,6 +15,7 @@ import { createPassThroughStream, createQuotaRetryStream, createRetryStatusTrack
 
 const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "agent");
 const CONFIG_PATH = join(AGENT_DIR, "relay-providers.json");
+const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
 const OPENAI_BEARER_APIS = new Set(["openai-completions", "openai-responses"]);
 
 function buildModel(model: RelayModelConfig, providerCompat?: Record<string, unknown>): ProviderModelConfig {
@@ -70,6 +71,52 @@ function unregisterManagedProviders(pi: ExtensionAPI, config: RelayConfig): void
 	for (const provider of config.providers) pi.unregisterProvider(provider.id);
 }
 
+async function readModelsStore(): Promise<Record<string, unknown> | undefined> {
+	try {
+		const parsed: unknown = JSON.parse(await readFile(MODELS_STORE_PATH, "utf8"));
+		return isObject(parsed) ? parsed : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * Hide unlisted built-in catalog models by re-registering the provider with only the
+ * kept models (full definitions copied from the models-store.json catalog cache).
+ * Auth, streaming, and catalog refresh stay with the built-in provider layer;
+ * unregistering later simply restores the full built-in model list.
+ * Returns the provider IDs that were filtered.
+ */
+function registerCatalogFilters(
+	pi: ExtensionAPI,
+	config: RelayConfig,
+	store: Record<string, unknown> | undefined,
+): string[] {
+	const filters = config.catalogFilters ?? {};
+	const filtered: string[] = [];
+	for (const [providerId, keepIds] of Object.entries(filters)) {
+		const entry = store?.[providerId];
+		const storeModels = isObject(entry) && Array.isArray(entry.models) ? entry.models : undefined;
+		if (!storeModels) {
+			console.warn(`[relay-providers] catalogFilters: no cached catalog data for "${providerId}" in models-store.json; skipping filter (run \`pi update --models\` to refresh the cache)`);
+			continue;
+		}
+		const defs: ProviderModelConfig[] = [];
+		for (const keepId of keepIds) {
+			const def = storeModels.find((model) => isObject(model) && model.id === keepId);
+			if (def) defs.push(def as unknown as ProviderModelConfig);
+			else console.warn(`[relay-providers] catalogFilters: model "${keepId}" not found in the cached catalog for "${providerId}"; skipped`);
+		}
+		if (defs.length === 0) {
+			console.warn(`[relay-providers] catalogFilters: no models resolved for "${providerId}"; provider left untouched`);
+			continue;
+		}
+		pi.registerProvider(providerId, { models: defs });
+		filtered.push(providerId);
+	}
+	return filtered;
+}
+
 export default async function (pi: ExtensionAPI) {
 	let configText: string;
 	try {
@@ -102,6 +149,8 @@ export default async function (pi: ExtensionAPI) {
 	let sessionContext: ExtensionContext | undefined;
 	const retryStatusTracker = createRetryStatusTracker(() => sessionContext);
 	registerVisibleProviders(pi, config, retryStatusTracker);
+	const store = config.catalogFilters ? await readModelsStore() : undefined;
+	const filteredProviderIds = registerCatalogFilters(pi, config, store);
 
 	pi.on("session_start", (_event, ctx) => {
 		sessionContext = ctx;
@@ -111,5 +160,7 @@ export default async function (pi: ExtensionAPI) {
 		retryStatusTracker.clearAll();
 		sessionContext = undefined;
 		unregisterManagedProviders(pi, config);
+		// Restores the full built-in model lists (unregister only drops our extension layer).
+		for (const providerId of filteredProviderIds) pi.unregisterProvider(providerId);
 	});
 }
