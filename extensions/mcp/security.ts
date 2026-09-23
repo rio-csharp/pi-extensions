@@ -25,6 +25,12 @@ export const MCP_REQUEST_TIMEOUT_MS = Number.isFinite(parsedRequestTimeout) && p
   ? parsedRequestTimeout
   : 15_000;
 
+const parsedConnectRetries = Number(process.env.PI_MCP_CONNECT_MAX_RETRIES ?? 2);
+export const MCP_CONNECT_MAX_RETRIES = Number.isInteger(parsedConnectRetries) && parsedConnectRetries >= 0
+  ? Math.min(parsedConnectRetries, 5)
+  : 2;
+export const MCP_CONNECT_RETRY_BASE_DELAY_MS = 1_000;
+
 const execFileAsync = promisify(execFile);
 
 export function sanitizeTerminalText(
@@ -73,6 +79,23 @@ export function isFileMissing(error: unknown): boolean {
 export function isUnauthorized(error: unknown): boolean {
   return error instanceof UnauthorizedError ||
     (error instanceof StreamableHTTPError && error.code === 401);
+}
+
+const TRANSIENT_NETWORK_CODES = new Set([
+  "ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND", "EPIPE",
+  "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT",
+]);
+
+/** True for transient network-level failures (TLS resets, DNS hiccups) that are worth retrying. */
+export function isTransientNetworkError(error: unknown): boolean {
+  if (error instanceof StreamableHTTPError || error instanceof UnauthorizedError) return false;
+  let current: unknown = error;
+  for (let depth = 0; depth < 4 && current && typeof current === "object"; depth++) {
+    const code = (current as { code?: unknown }).code;
+    if (typeof code === "string" && TRANSIENT_NETWORK_CODES.has(code)) return true;
+    current = (current as { cause?: unknown }).cause;
+  }
+  return false;
 }
 
 export function isStrictLoopbackUrl(url: URL): boolean {

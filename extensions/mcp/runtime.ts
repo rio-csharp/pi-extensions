@@ -14,9 +14,12 @@ import {
   CLIENT_NAME,
   CLIENT_VERSION,
   getErrorMessage,
+  isTransientNetworkError,
   isUnauthorized,
   MAX_DISCOVERY_ITEMS,
   MAX_DISCOVERY_PAGES,
+  MCP_CONNECT_MAX_RETRIES,
+  MCP_CONNECT_RETRY_BASE_DELAY_MS,
   MCP_REQUEST_TIMEOUT_MS,
   parseMcpUrl,
   safeFetch,
@@ -204,7 +207,7 @@ export class McpRuntime {
         if (!authenticate) throw new Error(`Authentication required. Run /mcp auth ${safeServerName(server)}`);
       }
       try {
-        connection = await this.connectionManager.createConnection(server, ctx, allowAuthPrompt && ctx.hasUI);
+        connection = await this.createConnectionWithRetry(server, ctx, allowAuthPrompt && ctx.hasUI);
       } catch (error) {
         if (!(error instanceof InteractiveAuthorizationRequiredError) &&
           (!isUnauthorized(error) || server.authType === "bearer")) throw error;
@@ -214,7 +217,7 @@ export class McpRuntime {
         server.authType = "oauth";
         server.oauthConfig ??= {};
         await this.store.saveConfig(this.servers);
-        connection = await this.connectionManager.createConnection(server, ctx, true);
+        connection = await this.createConnectionWithRetry(server, ctx, true);
       }
       this.connectionManager.setConnection(server.name, connection);
       const tools = await this.connectionManager.listAllTools(connection.client);
@@ -235,6 +238,24 @@ export class McpRuntime {
       if (!this.shuttingDown) server.error = message;
       throw new Error(message);
     }
+  }
+
+  /** Connect with limited retries for transient network failures (e.g. TLS resets from flaky routes). */
+  private async createConnectionWithRetry(server: MCPServerRuntime, ctx: McpUiContext, allowInteractive: boolean): Promise<MCPConnection> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt <= MCP_CONNECT_MAX_RETRIES; attempt++) {
+      if (attempt > 0) {
+        await new Promise(resolve => setTimeout(resolve, MCP_CONNECT_RETRY_BASE_DELAY_MS * attempt * attempt));
+        if (this.shuttingDown) throw new Error("MCP connection cancelled during session shutdown");
+      }
+      try {
+        return await this.connectionManager.createConnection(server, ctx, allowInteractive);
+      } catch (error) {
+        lastError = error;
+        if (error instanceof InteractiveAuthorizationRequiredError || !isTransientNetworkError(error)) throw error;
+      }
+    }
+    throw lastError;
   }
 
   connectInBackground(server: MCPServerRuntime, ctx: McpUiContext) {
