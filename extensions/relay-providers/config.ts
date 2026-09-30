@@ -284,18 +284,11 @@ function validateInput(value: unknown, path: string, errors: string[]): void {
 	}
 }
 
-function validateQuotaRetry(value: unknown, providerApi: unknown, path: string, errors: string[]): void {
+function validateQuotaRetry(value: unknown, path: string, errors: string[]): void {
 	if (value === undefined || value === false) return;
 	if (value !== true && !isObject(value)) {
 		errors.push(`${path} must be a boolean or retry-options object`);
 		return;
-	}
-	if (
-		providerApi !== undefined &&
-		providerApi !== "openai-completions" &&
-		providerApi !== "openai-responses"
-	) {
-		errors.push(`${path} is supported only when the provider API is "openai-completions" or "openai-responses"`);
 	}
 	if (value === true) return;
 
@@ -369,7 +362,7 @@ export function validateRelayConfig(value: unknown): { config: RelayConfig; warn
 		validateOptionalBoolean(provider.authHeader, `${providerPath}.authHeader`, errors);
 		validateHeaders(provider.headers, `${providerPath}.headers`, errors);
 		validateCompat(provider.compat, `${providerPath}.compat`, errors);
-		validateQuotaRetry(provider.quotaRetry, provider.api, `${providerPath}.quotaRetry`, errors);
+		validateQuotaRetry(provider.quotaRetry, `${providerPath}.quotaRetry`, errors);
 
 		if (!Array.isArray(provider.models) || provider.models.length === 0) {
 			errors.push(`${providerPath}.models must be a nonempty array`);

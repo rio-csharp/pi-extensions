@@ -8,7 +8,7 @@ import {
 	type SimpleStreamOptions,
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
-import { getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
+import { getApiProvider } from "@earendil-works/pi-ai/compat";
 import { type QuotaRetryOptions, ZERO_COST } from "./config.ts";
 import { redactRelayErrorText } from "./sanitize.ts";
 
@@ -120,8 +120,9 @@ export function createQuotaRetryStream(
 	providerLabel: string,
 	retry: QuotaRetryOptions,
 	statusTracker: RetryStatusTracker,
+	api: string,
 ): OpenAICompletionsStream {
-	const completions = openAICompletionsApi();
+	const implementation = getApiProvider(api);
 
 	return (model, context, options) => {
 		const output = createAssistantMessageEventStream();
@@ -139,7 +140,8 @@ export function createQuotaRetryStream(
 					return;
 				}
 
-				const current = completions.streamSimple(model, context, options);
+				if (!implementation) throw new Error("unsupported API implementation");
+				const current = implementation.streamSimple(model as never, context, options);
 				let emitted = false;
 				let requestError: AssistantMessage | undefined;
 

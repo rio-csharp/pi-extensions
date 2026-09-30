@@ -18,14 +18,18 @@ const CONFIG_PATH = join(AGENT_DIR, "relay-providers.json");
 const MODELS_STORE_PATH = join(AGENT_DIR, "models-store.json");
 const OPENAI_BEARER_APIS = new Set(["openai-completions", "openai-responses"]);
 
-function buildModel(model: RelayModelConfig, providerCompat?: Record<string, unknown>): ProviderModelConfig {
+function buildModel(
+	model: RelayModelConfig,
+	providerApi: string,
+	providerCompat?: Record<string, unknown>,
+): ProviderModelConfig {
 	const compat = providerCompat || model.compat
 		? { ...providerCompat, ...model.compat }
 		: undefined;
 	return {
 		id: model.id,
 		name: model.name ?? model.id,
-		api: model.api as never,
+		api: (model.api ?? providerApi) as never,
 		baseUrl: model.baseUrl,
 		reasoning: model.reasoning ?? false,
 		thinkingLevelMap: model.thinkingLevelMap,
@@ -59,9 +63,9 @@ function registerVisibleProviders(
 			authHeader: provider.authHeader ?? OPENAI_BEARER_APIS.has(api),
 			headers: provider.headers,
 			streamSimple: (quotaRetry
-				? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker)
+				? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker, api)
 				: createPassThroughStream(api)) as never,
-			models: visibleModels.map((model) => buildModel(model, provider.compat)),
+			models: visibleModels.map((model) => buildModel(model, api, provider.compat)),
 		});
 	}
 }
