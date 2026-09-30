@@ -4,9 +4,9 @@ import {
 	createAssistantMessageEventStream,
 	type AssistantMessage,
 	type AssistantMessageEventStream,
-	type Context,
 	type Model,
 	type SimpleStreamOptions,
+	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { getApiProvider, openAICompletionsApi } from "@earendil-works/pi-ai/compat";
 import { type QuotaRetryOptions, ZERO_COST } from "./config.ts";
@@ -17,7 +17,7 @@ const RETRY_STATUS_PREFIX = "relay-quota-retry";
 
 export type OpenAICompletionsStream = (
 	model: Model<"openai-completions">,
-	context: Context,
+	context: TranscriptContext,
 	options?: SimpleStreamOptions,
 ) => AssistantMessageEventStream;
 
