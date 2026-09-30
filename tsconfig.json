@@ -11,7 +11,7 @@
   },
   "include": [
     "extensions/compact-tool-ui/**/*.ts",
-    "extensions/mcp/**/*.ts",
+    "extensions/mcp-sanitize/**/*.ts",
     "extensions/compact-footer/**/*.ts",
     "extensions/kimi-usage/**/*.ts",
     "extensions/relay-balance/**/*.ts",

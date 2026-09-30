@@ -8,7 +8,7 @@ Standalone extensions for the [pi coding agent](https://github.com/earendil-work
 - [compact-tool-ui](extensions/compact-tool-ui/) — compact tool-call and thinking rendering
 - [keep-model-on-new](extensions/keep-model-on-new/) — carries the active model into `/new` sessions
 - [kimi-usage](extensions/kimi-usage/) — built-in Kimi usage percentages as a status
-- [mcp](extensions/mcp/) — remote Streamable HTTP MCP servers
+- [mcp-sanitize](extensions/mcp-sanitize/) — strips hostile characters from built-in MCP tool results
 - [relay-balance](extensions/relay-balance/) — active relay provider's balance as a status
 - [relay-providers](extensions/relay-providers/) — registers providers/models from local config
 - [subagent](extensions/subagent/) — background pi subprocesses with supervision
