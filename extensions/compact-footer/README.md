@@ -12,7 +12,7 @@ Left to right: cwd (home-relative) + git branch + session name, context usage (w
 
 Other extensions publish text through pi's `setStatus()` API; this footer never fetches anything itself.
 
-- Keys in `INLINE_STATUS_KEYS` (`relay-balance`, `kimi-usage`) render inline on the main line
+- Keys in `INLINE_STATUS_KEYS` (`relay-balance`, `kimi-usage`, `opendesign-usage`) render inline on the main line
 - Keys starting with `footer-row-` each get a dedicated line below
 - Everything else shares one compact line at the bottom
 

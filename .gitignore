@@ -10,6 +10,7 @@ auth.json
 .credentials.json
 models-store.json
 relay-providers.json
+opendesign-usage.json
 mcp-config.json
 settings.json
 

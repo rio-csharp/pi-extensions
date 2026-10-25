@@ -1,0 +1,6 @@
+{
+  "controlKey": "$OPENDESIGN_CONTROL_KEY",
+  "apiUrl": "https://amr-api.open-design.ai",
+  "providers": ["amr-link"],
+  "refreshIntervalMs": 300000
+}

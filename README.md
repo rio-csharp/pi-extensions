@@ -9,6 +9,7 @@ Standalone extensions for the [pi coding agent](https://github.com/earendil-work
 - [keep-model-on-new](extensions/keep-model-on-new/) — carries the active model into `/new` sessions
 - [kimi-usage](extensions/kimi-usage/) — built-in Kimi usage percentages as a status
 - [mcp-sanitize](extensions/mcp-sanitize/) — strips hostile characters from built-in MCP tool results
+- [opendesign-usage](extensions/opendesign-usage/) — OpenDesign (AMR) 5h/7d allowance windows as a status
 - [relay-balance](extensions/relay-balance/) — active relay provider's balance as a status
 - [relay-providers](extensions/relay-providers/) — registers providers/models from local config
 - [subagent](extensions/subagent/) — background pi subprocesses with supervision
