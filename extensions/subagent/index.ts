@@ -1,15 +1,12 @@
-import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import {
-	CONFIG_DIR_NAME,
 	type ExtensionAPI,
 	type ExtensionContext,
-	getAgentDir,
 } from "@earendil-works/pi-coding-agent";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, discoverAgents } from "./agents.ts";
 import { loadSubagentConfig } from "./config.ts";
 import { JobStore, type JobItem } from "./jobs.ts";
-import { getContextModel, isDepthLimitReached, providerEnvNames, runChild, selectedProvider } from "./process.ts";
+import { getContextModel, isDepthLimitReached, providerEnvNames, runChild } from "./process.ts";
 import { SubagentJobsParams, SubagentParams } from "./schema.ts";
 import { quoteExactPath } from "./security.ts";
 import { Semaphore } from "./slots.ts";
@@ -38,35 +35,13 @@ function notifyConfigWarning(ctx: ExtensionContext): void {
 	}
 }
 
-function childInvocationArgs(
-	agents: AgentConfig[],
-	agentName: string | undefined,
-	ctx: ExtensionContext,
-) {
-	const agent = agentName ? agents.find((a) => a.name === agentName) : undefined;
-	const model = agent?.model ?? getContextModel(ctx);
-	const provider = selectedProvider(agents, agentName, ctx);
+function childInvocationArgs(ctx: ExtensionContext) {
+	const provider = ctx.model?.provider;
 	return {
-		agent,
-		model,
+		model: getContextModel(ctx),
 		provider,
 		providerEnvNames: providerEnvNames(provider, ctx),
 	};
-}
-
-function unknownAgentNames(items: JobItem[], agents: AgentConfig[]): string[] {
-	const unknown = items
-		.map((item) => item.agent)
-		.filter((name): name is string => Boolean(name))
-		.filter((name) => !agents.some((agent) => agent.name === name));
-	return [...new Set(unknown)];
-}
-
-function projectAgentsRequested(items: JobItem[], agents: AgentConfig[]): AgentConfig[] {
-	const requested = new Set(items.map((item) => item.agent).filter((name): name is string => Boolean(name)));
-	return [...requested]
-		.map((name) => agents.find((agent) => agent.name === name))
-		.filter((agent): agent is AgentConfig => agent?.source === "project");
 }
 
 export default function (pi: ExtensionAPI) {
@@ -101,48 +76,32 @@ export default function (pi: ExtensionAPI) {
 			"Batch parallel and sequential chain modes are also supported.",
 			"Completion or interruption is delivered automatically as a steering message and triggers the main agent when idle.",
 			"Use subagent_jobs to steer a running child or inspect, resume, and cancel supervised jobs.",
-			"If agent is omitted, the child runs with pi defaults (current model, default tools).",
-			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
-			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const agentScope: AgentScope = params.agentScope ?? "user";
 			const detailsFor =
 				(mode: SubagentMode, projectAgentsDir: string | null = null) =>
 				(results: SingleResult[]): SubagentDetails => ({
 					mode,
-					agentScope,
+					agentScope: "user",
 					projectAgentsDir,
 					results,
 				});
-
-			if (agentScope !== "user" && !ctx.isProjectTrusted()) {
-				return {
-					content: [{ type: "text", text: "Project-local agents require a trusted project." }],
-					details: detailsFor("single")([]),
-					isError: true,
-				};
-			}
-			const discovery = discoverAgents(ctx.cwd, agentScope, ctx.cwd);
-			const agents = discovery.agents;
-			const confirmProjectAgents = params.confirmProjectAgents ?? true;
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
 			const invalidBatchTitle = [...(params.chain ?? []), ...(params.tasks ?? [])]
 				.some((item) => !item.title.trim());
 			const hasSingle = Boolean(params.task && params.title?.trim());
-			const incompleteSingle = Boolean(params.agent || params.task || params.title) && !hasSingle;
+			const incompleteSingle = Boolean(params.task || params.title) && !hasSingle;
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
 			if (modeCount !== 1 || incompleteSingle || invalidBatchTitle) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
 				return {
 					content: [{
 						type: "text",
-						text: `Invalid parameters. Provide exactly one mode and a concise title for every subagent.\nAvailable agents: ${available}`,
+						text: "Invalid parameters. Provide exactly one mode and a concise title for every subagent.",
 					}],
 					details: detailsFor("single")([]),
 				};
@@ -153,34 +112,7 @@ export default function (pi: ExtensionAPI) {
 				? params.chain!
 				: hasTasks
 					? params.tasks!
-					: [{ agent: params.agent, title: params.title!, task: params.task!, cwd: params.cwd }];
-
-			if ((agentScope === "project" || agentScope === "both") && confirmProjectAgents && ctx.hasUI) {
-				const requestedProjectAgents = projectAgentsRequested(requested, agents);
-				if (requestedProjectAgents.length > 0) {
-					const names = requestedProjectAgents.map((a) => boundedMetadata(a.name)).join(", ");
-					const dir = discovery.projectAgentsDir ? quoteExactPath(discovery.projectAgentsDir) : "(unknown)";
-					const ok = await ctx.ui.confirm(
-						"Run project-local agents?",
-						`Agents: ${names}\nSource: ${dir}\n\nProject agents are repo-controlled. Only continue for trusted repositories.`,
-					);
-					if (!ok) {
-						return {
-							content: [{ type: "text", text: "Canceled: project-local agents not approved." }],
-							details: detailsFor(mode, discovery.projectAgentsDir)([]),
-						};
-					}
-				}
-			}
-
-			const unknown = unknownAgentNames(requested, agents);
-			if (unknown.length > 0) {
-				return {
-					content: [{ type: "text", text: `Unknown agents: ${unknown.join(", ")}` }],
-					details: detailsFor(mode, discovery.projectAgentsDir)([]),
-					isError: true,
-				};
-			}
+					: [{ title: params.title!, task: params.task!, cwd: params.cwd }];
 
 			notifyConfigWarning(ctx);
 
@@ -188,12 +120,12 @@ export default function (pi: ExtensionAPI) {
 				const job = store.start(
 					{
 						mode,
-						agentScope,
-						projectAgentsDir: discovery.projectAgentsDir,
-						confirmProjectAgents,
+						agentScope: "user",
+						projectAgentsDir: null,
+						confirmProjectAgents: false,
 						items: requested.map((item) => ({ ...item, title: item.title.trim() })),
 					},
-					agents,
+					[],
 					ctx,
 				);
 				return {
@@ -211,18 +143,17 @@ export default function (pi: ExtensionAPI) {
 				taskOnUpdate: ((partial: AgentToolResult<SubagentDetails>) => void) | undefined,
 				makeDetails: (results: SingleResult[]) => SubagentDetails,
 			): Promise<SingleResult> => {
-				const invocation = childInvocationArgs(agents, item.agent, ctx);
+				const invocation = childInvocationArgs(ctx);
 				const slotSignal = signal ?? new AbortController().signal;
 				return semaphore.with(slotSignal, () =>
 					whileRunning(
-						item.agent ?? DEFAULT_AGENT_LABEL,
+						DEFAULT_AGENT_LABEL,
 						item.title,
 						ctx,
 						(onStatusUpdate) =>
 							runChild({
 								defaultCwd: ctx.cwd,
-								agent: invocation.agent,
-								agentName: item.agent ?? DEFAULT_AGENT_LABEL,
+								agentName: DEFAULT_AGENT_LABEL,
 								task: item.task,
 								cwd: item.cwd,
 								step,
@@ -253,20 +184,20 @@ export default function (pi: ExtensionAPI) {
 							if (currentResult) {
 								onUpdate({
 									content: partial.content,
-									details: detailsFor("chain", discovery.projectAgentsDir)([...results, currentResult]),
+									details: detailsFor("chain")([...results, currentResult]),
 								});
 							}
 						}
 						: undefined;
 
-					const result = await runOne({ ...step, task: taskWithContext }, i + 1, chainUpdate, detailsFor("chain", discovery.projectAgentsDir));
+					const result = await runOne({ ...step, task: taskWithContext }, i + 1, chainUpdate, detailsFor("chain"));
 					results.push(result);
 
 					if (isFailedResult(result)) {
 						const errorMsg = getResultOutput(result);
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${boundedMetadata(step.agent ?? DEFAULT_AGENT_LABEL)}): ${sanitizeBounded(errorMsg, PER_TASK_OUTPUT_CAP, "Error output truncated")}` }],
-							details: detailsFor("chain", discovery.projectAgentsDir)(results),
+							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${boundedMetadata(DEFAULT_AGENT_LABEL)}): ${sanitizeBounded(errorMsg, PER_TASK_OUTPUT_CAP, "Error output truncated")}` }],
+							details: detailsFor("chain")(results),
 							isError: true,
 						};
 					}
@@ -274,7 +205,7 @@ export default function (pi: ExtensionAPI) {
 				}
 				return {
 					content: [{ type: "text", text: getFinalOutput(results[results.length - 1].messages) || "(no output)" }],
-					details: detailsFor("chain", discovery.projectAgentsDir)(results),
+					details: detailsFor("chain")(results),
 				};
 			}
 
@@ -283,7 +214,7 @@ export default function (pi: ExtensionAPI) {
 				const allResults: SingleResult[] = new Array(tasks.length);
 				for (let i = 0; i < tasks.length; i++) {
 					allResults[i] = {
-						agent: tasks[i].agent ?? DEFAULT_AGENT_LABEL,
+						agent: DEFAULT_AGENT_LABEL,
 						agentSource: "unknown",
 						task: tasks[i].task,
 						exitCode: -1, // -1 = still running
@@ -299,7 +230,7 @@ export default function (pi: ExtensionAPI) {
 						const done = allResults.filter((r) => r.exitCode !== -1).length;
 						onUpdate({
 							content: [{ type: "text", text: `Parallel: ${done}/${allResults.length} done, ${running} running...` }],
-							details: detailsFor("parallel", discovery.projectAgentsDir)([...allResults]),
+							details: detailsFor("parallel")([...allResults]),
 						});
 					}
 				};
@@ -310,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 							allResults[index] = partial.details.results[0];
 							emitParallelUpdate();
 						}
-					}, detailsFor("parallel", discovery.projectAgentsDir));
+					}, detailsFor("parallel"));
 					allResults[index] = result;
 					emitParallelUpdate();
 					return result;
@@ -329,27 +260,27 @@ export default function (pi: ExtensionAPI) {
 						type: "text",
 						text: `Parallel: ${successCount}/${results.length} succeeded\n\n${summaries.join("\n\n---\n\n")}`,
 					}],
-					details: detailsFor("parallel", discovery.projectAgentsDir)(results),
+					details: detailsFor("parallel")(results),
 				};
 			}
 
 			const result = await runOne(
-				{ agent: params.agent, title: params.title!, task: params.task!, cwd: params.cwd },
+				{ title: params.title!, task: params.task!, cwd: params.cwd },
 				undefined,
 				onUpdate,
-				detailsFor("single", discovery.projectAgentsDir),
+				detailsFor("single"),
 			);
 			if (isFailedResult(result)) {
 				const errorMsg = getResultOutput(result);
 				return {
 					content: [{ type: "text", text: `Agent ${result.stopReason || "failed"}: ${errorMsg}` }],
-					details: detailsFor("single", discovery.projectAgentsDir)([result]),
+					details: detailsFor("single")([result]),
 					isError: true,
 				};
 			}
 			return {
 				content: [{ type: "text", text: getFinalOutput(result.messages) || "(no output)" }],
-				details: detailsFor("single", discovery.projectAgentsDir)([result]),
+				details: detailsFor("single")([result]),
 			};
 		},
 	});

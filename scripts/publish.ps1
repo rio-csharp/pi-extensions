@@ -122,11 +122,10 @@ try {
 
     # Phase 1: reproduce installs and validate without changing Git history.
     Invoke-Npm ci --ignore-scripts
-    Invoke-Npm --prefix extensions/mcp ci --ignore-scripts
     Invoke-Npm run check
+    # Production dependency audit only. devDependencies track Pi itself and can carry
+    # advisories that are fixed only by a breaking Pi upgrade.
     Invoke-Npm run audit
-    Invoke-Npm audit
-    Invoke-Npm --prefix extensions/mcp audit
 
     Write-Host "Working-tree paths proposed for staging:" -ForegroundColor Cyan
     Invoke-Git status --short
@@ -147,31 +146,10 @@ try {
         throw "Refusing to publish a tree containing symlinks or gitlinks: $($unsafeTreeEntries -join '; ')"
     }
 
-    $requiredStatuses = @{
-        "package-lock.json" = '^[AM]$'
-        "extensions/mcp/package-lock.json" = '^[AM]$'
-        "extensions/mcp/commands.ts" = '^D$'
-    }
-    foreach ($requiredPath in $requiredStatuses.Keys) {
-        $statusLines = @(Get-GitOutput diff --cached --name-status --no-renames -- ":(literal)$requiredPath")
-        if ($statusLines.Count -ne 1) {
-            throw "Required release change is missing or ambiguous: $requiredPath"
-        }
-        $status = ($statusLines[0] -split "`t", 2)[0]
-        if ($status -notmatch $requiredStatuses[$requiredPath]) {
-            throw "Unexpected staged status '$status' for required release path $requiredPath."
-        }
-    }
     foreach ($requiredNoticePath in @("LICENSE", "NOTICE")) {
         Assert-RegularIndexBlob $requiredNoticePath
     }
-    foreach ($lockPath in @("package-lock.json", "extensions/mcp/package-lock.json")) {
-        Assert-RegularIndexBlob $lockPath
-    }
-    $obsoleteEntries = @(Get-IndexEntries "extensions/mcp/commands.ts")
-    if ($obsoleteEntries.Count -ne 0) {
-        throw "extensions/mcp/commands.ts must be absent from the prospective release tree."
-    }
+    Assert-RegularIndexBlob "package-lock.json"
 
     $forbiddenNames = @(
         "auth.json",
