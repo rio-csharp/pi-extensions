@@ -5,7 +5,7 @@ import { visibleWidth } from "@earendil-works/pi-tui";
 import { countOutputLines } from "./built-in-tools.ts";
 import compactToolUi from "./index.ts";
 import {
-	CompactInvocationComponent,
+	CompactInvocationComponent,	EXPAND_AFFORDANCE,	createCompactRenderer,
 	type CompactRenderState,
 } from "./compact-tool-renderer.ts";
 
@@ -70,6 +70,81 @@ type RegisteredTool = {
 	renderCall?: (args: Record<string, unknown>, theme: Theme, context: any) => unknown;
 };
 
+test("marks rows that can expand and keeps the header visible when they are open", () => {
+	const full = { render: () => ["  file line 1", "  file line 2"], invalidate() {} };
+	const renderer = createCompactRenderer("read", (args) => String(args.path), {
+		expanded: () => ({ renderCall: () => full, renderResult: () => full }),
+	});
+	const context = (expanded: boolean, lastComponent?: unknown) => ({
+		args: { path: "src/app.ts" },
+		toolCallId: "call",
+		invalidate() {},
+		lastComponent,
+		state: {} as CompactRenderState,
+		cwd: process.cwd(),
+		executionStarted: true,
+		argsComplete: true,
+		isPartial: false,
+		expanded,
+		showImages: false,
+		isError: false,
+	});
+
+	const collapsed = renderer.renderCall({ path: "src/app.ts" }, identityTheme, context(false) as never);
+	const collapsedLines = collapsed.render(80);
+	assert.equal(collapsedLines.length, 1);
+	assert(collapsedLines[0].includes(` ${EXPAND_AFFORDANCE.collapsed} src/app.ts`));
+
+	const expanded = renderer.renderCall({ path: "src/app.ts" }, identityTheme, context(true, collapsed) as never);
+	const expandedLines = expanded.render(80);
+	assert.equal(expandedLines.length, 3);
+	assert(expandedLines[0].includes(` ${EXPAND_AFFORDANCE.expanded} src/app.ts`));
+	assert.deepEqual(expandedLines.slice(1), ["  file line 1", "  file line 2"]);
+});
+
+test("shows no affordance when a row has nothing to expand", () => {
+	const renderer = createCompactRenderer("read", (args) => String(args.path));
+	const lines = renderer
+		.renderCall({ path: "src/app.ts" }, identityTheme, callContext({ path: "src/app.ts" }) as never)
+		.render(80);
+	assert.equal(lines.length, 1);
+	assert(!lines[0].includes(EXPAND_AFFORDANCE.collapsed));
+});
+
+test("collapses back to nothing and never repeats the header when expanded", () => {
+	const full = { render: () => ["FULL-CONTENT"], invalidate() {} };
+	const renderer = createCompactRenderer("read", (args) => String(args.path), {
+		expanded: () => ({ renderCall: () => full, renderResult: () => full }),
+	});
+	const state = {} as CompactRenderState;
+	const base = {
+		args: { path: "src/app.ts" },
+		toolCallId: "call",
+		invalidate() {},
+		state,
+		cwd: process.cwd(),
+		executionStarted: true,
+		argsComplete: true,
+		isPartial: false,
+		showImages: false,
+		isError: false,
+	};
+
+	const expanded = renderer.renderResult({}, { isPartial: false }, identityTheme, {
+		...base,
+		expanded: true,
+		lastComponent: undefined,
+	} as never);
+	assert.deepEqual(expanded.render(60), ["FULL-CONTENT"], "the result slot must not add its own header");
+
+	const collapsed = renderer.renderResult({}, { isPartial: false }, identityTheme, {
+		...base,
+		expanded: false,
+		lastComponent: expanded,
+	} as never);
+	assert.deepEqual(collapsed.render(60), [], "collapsing must clear the expanded view");
+});
+
 const identityTheme = {
 	fg: (_color: string, text: string) => text,
 	bold: (text: string) => text,
@@ -98,6 +173,7 @@ test("all overridden built-in tools use the shared capped renderer without mutat
 		registerTool(tool: RegisteredTool) {
 			tools.set(tool.name, tool);
 		},
+		registerToolRenderer() {},
 		registerMarkdownTransformer() {},
 		on() {},
 	} as unknown as ExtensionAPI;

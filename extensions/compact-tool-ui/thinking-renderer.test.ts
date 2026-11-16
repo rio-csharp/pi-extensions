@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { registerThinkingRenderer } from "./thinking-renderer.ts";
+import { HIDDEN_THINKING_LABEL, registerThinkingRenderer } from "./thinking-renderer.ts";
 
 type MarkdownTransformer = (
 	markdown: string,
@@ -14,14 +14,19 @@ type MarkdownTransformer = (
 
 function getTransformer(): MarkdownTransformer {
 	let transformer: MarkdownTransformer | undefined;
+	let hiddenLabel: string | undefined;
 	const pi = {
 		registerMarkdownTransformer(value: MarkdownTransformer) {
 			transformer = value;
+		},
+		on(event: string, handler: (event: unknown, ctx: unknown) => void) {
+			if (event === "session_start") handler({}, { mode: "tui", ui: { setHiddenThinkingLabel: (label: string) => (hiddenLabel = label) } });
 		},
 	} as unknown as ExtensionAPI;
 
 	registerThinkingRenderer(pi);
 	assert(transformer, "thinking renderer did not register a transformer");
+	assert.equal(hiddenLabel, HIDDEN_THINKING_LABEL);
 	return transformer;
 }
 

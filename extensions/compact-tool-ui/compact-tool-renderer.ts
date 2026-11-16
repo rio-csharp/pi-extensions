@@ -1,5 +1,6 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
+	Container,
 	truncateToWidth,
 	visibleWidth,
 	wrapTextWithAnsi,
@@ -30,6 +31,26 @@ export interface CompactRenderState {
 	finishedAt?: number;
 	outputLines?: number;
 	callComponent?: CompactInvocationComponent;
+	expanded?: ExpandedSlot;
+}
+
+interface ExpandedSlot {
+	state: Record<string, any>;
+	lastComponent?: Component;
+}
+
+export interface ExpandedRenderers {
+	renderCall?: (
+		args: Record<string, any>,
+		theme: Theme,
+		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+	) => Component;
+	renderResult?: (
+		result: any,
+		options: { isPartial: boolean },
+		theme: Theme,
+		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+	) => Component;
 }
 
 export interface CompactRendererOptions {
@@ -38,6 +59,8 @@ export interface CompactRendererOptions {
 		options: { isPartial: boolean },
 		state: CompactRenderState,
 	) => void;
+	/** Renderers used while the row is expanded, so the compact row can reveal the full built-in view. */
+	expanded?: () => ExpandedRenderers | undefined;
 }
 
 export interface CompactRenderer {
@@ -66,6 +89,11 @@ class EmptyComponent implements Component {
 
 const MAX_INVOCATION_LINES = 3;
 const ELLIPSIS = "...";
+const COLLAPSED_GLYPH = "▸";
+const EXPANDED_GLYPH = "▾";
+
+/** What the collapsed and expanded states look like, for tests and for the hint text. */
+export const EXPAND_AFFORDANCE = { collapsed: COLLAPSED_GLYPH, expanded: EXPANDED_GLYPH } as const;
 
 function normalizeInvocation(invocation: string): string {
 	const normalized = invocation.replace(/\r\n|\r/g, "\n");
@@ -176,6 +204,7 @@ export function createCompactRenderer(
 		args: Record<string, any>,
 		theme: Theme,
 		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+		expandable: boolean,
 	): CompactInvocationComponent => {
 		const state = context.state;
 		const now = Date.now();
@@ -216,6 +245,7 @@ export function createCompactRenderer(
 		const toolName = theme.fg("toolTitle", theme.bold(name));
 		const prefix = `${timestamp} ${icon} ${toolName}${status}`;
 		const invocation = formatInvocation(args, theme);
+		const affordance = expandable ? `${theme.fg("dim", context.expanded ? EXPANDED_GLYPH : COLLAPSED_GLYPH)} ` : "";
 
 		let component = state.callComponent;
 		if (!component && context.lastComponent instanceof CompactInvocationComponent) {
@@ -223,21 +253,70 @@ export function createCompactRenderer(
 		}
 		component ??= new CompactInvocationComponent();
 		state.callComponent = component;
-		component.setContent(prefix, invocation);
+		component.setContent(prefix, `${affordance}${invocation}`);
 		return component;
+	};
+
+	// Built-in renderers reuse `context.lastComponent` and call `setText`, so the expanded view needs its own slot.
+	const renderExpanded = (
+		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+		render: (context: ToolRenderContext<CompactRenderState, Record<string, any>>) => Component,
+	): Component => {
+		const slot = (context.state.expanded ??= { state: {} });
+		const component = render({
+			...context,
+			state: slot.state as CompactRenderState,
+			lastComponent: slot.lastComponent,
+		});
+		slot.lastComponent = component;
+		return component;
+	};
+
+	// The header line stays visible when expanded, so the row always shows what it is and that it is open.
+	const composeExpanded = (
+		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+		theme: Theme,
+		args: Record<string, any>,
+		content: Component,
+	): Component => {
+		const container = context.lastComponent instanceof Container ? context.lastComponent : new Container();
+		container.clear();
+		container.addChild(updateCallText(args, theme, context, true));
+		container.addChild(content);
+		return container;
+	};
+
+	const hasExpandedView = (): boolean => {
+		const expanded = options.expanded?.();
+		return Boolean(expanded?.renderCall || expanded?.renderResult);
 	};
 
 	return {
 		renderShell: "self",
 
 		renderCall(args, theme, context) {
-			return updateCallText(args, theme, context);
+			const delegate = context.expanded ? options.expanded?.() : undefined;
+			if (delegate?.renderCall) {
+				const content = renderExpanded(context, (expandedContext) => delegate.renderCall!(args, theme, expandedContext));
+				return composeExpanded(context, theme, args, content);
+			}
+			return updateCallText(args, theme, context, hasExpandedView());
 		},
 
 		renderResult(result, renderOptions, theme, context) {
+			const delegate = context.expanded ? options.expanded?.() : undefined;
+			if (delegate?.renderResult) {
+				// The header belongs to the call slot, which pi renders above this one; adding it here
+				// would print it twice.
+				return renderExpanded(context, (expandedContext) =>
+					delegate.renderResult!(result, renderOptions, theme, expandedContext),
+				);
+			}
 			options.observeResult?.(result, renderOptions, context.state);
-			updateCallText(context.args, theme, context);
-			return context.lastComponent ?? new EmptyComponent();
+			updateCallText(context.args, theme, context, hasExpandedView());
+			// Never reuse `lastComponent`: after a collapse it is still the expanded container, which
+			// would leave the full built-in view on screen.
+			return new EmptyComponent();
 		},
 
 		dispose() {

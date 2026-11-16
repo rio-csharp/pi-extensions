@@ -17,8 +17,9 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import {
 	createCompactRenderer,
-	type CompactRenderer,
 	type CompactRenderState,
+	type CompactRenderer,
+	type ExpandedRenderers,
 } from "./compact-tool-renderer.ts";
 
 const TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"] as const;
@@ -160,7 +161,7 @@ function formatInvocation(name: ToolName, args: Record<string, any>, theme: Them
 	}
 }
 
-function getTextResult(result: any): string {
+export function getTextResult(result: any): string {
 	const block = result?.content?.find((item: any) => item?.type === "text");
 	return typeof block?.text === "string" ? block.text : "";
 }
@@ -178,17 +179,18 @@ export function registerCompactBuiltInTools(pi: ExtensionAPI): void {
 
 	for (const name of TOOL_NAMES) {
 		const original = createDefinition(name, process.cwd(), initialSettings);
-		const renderer = createCompactRenderer(
-			name,
-			(args, theme) => formatInvocation(name, args, theme),
-			name === "bash" || name === "powershell"
-				? {
-						observeResult(result, options, state) {
+		const renderer = createCompactRenderer(name, (args, theme) => formatInvocation(name, args, theme), {
+			observeResult:
+				name === "bash" || name === "powershell"
+					? (result, options, state) => {
 							if (options.isPartial) state.outputLines = countOutputLines(getTextResult(result));
-						},
-					}
-				: undefined,
-		);
+						}
+					: undefined,
+			expanded: () => ({
+				renderCall: original.renderCall as ExpandedRenderers["renderCall"],
+				renderResult: original.renderResult as ExpandedRenderers["renderResult"],
+			}),
+		});
 		renderers.push(renderer);
 
 		pi.registerTool({
