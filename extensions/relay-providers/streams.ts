@@ -9,6 +9,7 @@ import {
 	type TranscriptContext,
 } from "@earendil-works/pi-ai";
 import { getApiProvider } from "@earendil-works/pi-ai/compat";
+import { applyAliasToPayload, readThinkingLevel } from "./aliases.ts";
 import { type QuotaRetryOptions, ZERO_COST } from "./config.ts";
 import { redactRelayErrorText } from "./sanitize.ts";
 
@@ -26,6 +27,29 @@ export function isConfiguredRetryError(message: string | undefined, retry: Quota
 	if (!message) return false;
 	const normalized = message.toLocaleLowerCase();
 	return retry.errorSubstrings.some((substring) => normalized.includes(substring.toLocaleLowerCase()));
+}
+
+/**
+ * Rewrite the wire model ID for the request while the picker, history, and cost accounting keep
+ * the registration ID. The caller's onPayload hook runs first and the alias is forced afterwards,
+ * so a hook returning undefined cannot delete the rewrite.
+ */
+function withAliasRewrite(
+	options: SimpleStreamOptions | undefined,
+	aliasId: string,
+	api: string,
+): SimpleStreamOptions {
+	return {
+		...options,
+		onPayload: (payload: unknown, payloadModel: unknown) =>
+			applyAliasToPayload(
+				payload,
+				aliasId,
+				api,
+				options?.onPayload as ((payload: unknown, model: unknown) => unknown) | undefined,
+				payloadModel,
+			),
+	};
 }
 
 function passThroughRelayError(message: AssistantMessage): AssistantMessage {
@@ -121,6 +145,7 @@ export function createQuotaRetryStream(
 	retry: QuotaRetryOptions,
 	statusTracker: RetryStatusTracker,
 	api: string,
+	resolveModelId?: (level: string | undefined) => string | undefined,
 ): OpenAICompletionsStream {
 	const implementation = getApiProvider(api);
 
@@ -128,6 +153,9 @@ export function createQuotaRetryStream(
 		const output = createAssistantMessageEventStream();
 		const status = statusTracker.createHandle();
 		let lastError: AssistantMessage | undefined;
+		const aliasId = resolveModelId?.(readThinkingLevel(options));
+		const requestOptions =
+			aliasId && aliasId !== model.id ? withAliasRewrite(options, aliasId, api) : options;
 
 		void (async () => {
 			let attempt = 0;
@@ -141,7 +169,7 @@ export function createQuotaRetryStream(
 				}
 
 				if (!implementation) throw new Error("unsupported API implementation");
-				const current = implementation.streamSimple(model as never, context, options);
+				const current = implementation.streamSimple(model as never, context, requestOptions);
 				let emitted = false;
 				let requestError: AssistantMessage | undefined;
 
@@ -214,13 +242,19 @@ export function createQuotaRetryStream(
 	};
 }
 
-export function createPassThroughStream(api: string): OpenAICompletionsStream {
+export function createPassThroughStream(
+	api: string,
+	resolveModelId?: (level: string | undefined) => string | undefined,
+): OpenAICompletionsStream {
 	return (model, context, options) => {
 		const output = createAssistantMessageEventStream();
 		void (async () => {
 			const implementation = getApiProvider(api);
 			if (!implementation) throw new Error("unsupported API implementation");
-			for await (const event of implementation.streamSimple(model, context, options)) {
+			const aliasId = resolveModelId?.(readThinkingLevel(options));
+			const requestOptions =
+				aliasId && aliasId !== model.id ? withAliasRewrite(options, aliasId, api) : options;
+			for await (const event of implementation.streamSimple(model, context, requestOptions)) {
 				if (event.type === "error") {
 					const rawError = passThroughRelayError(event.error);
 					output.push({

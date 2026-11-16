@@ -44,6 +44,7 @@ const MODEL_KEYS = new Set([
 	"cost",
 	"headers",
 	"compat",
+	"modelAliases",
 ]);
 const COST_KEYS = new Set(["input", "output", "cacheRead", "cacheWrite", "tiers"]);
 const COST_TIER_KEYS = new Set(["inputTokensAbove", "input", "output", "cacheRead", "cacheWrite"]);
@@ -73,6 +74,11 @@ export interface RelayCostConfig extends RelayCostRates {
 export interface RelayModelConfig {
 	id: string;
 	hidden?: boolean;
+	/**
+	 * Thinking level -> upstream model ID override. Lets one picker entry stand in for several
+	 * upstream model IDs that differ only by baked-in thinking strength.
+	 */
+	modelAliases?: Partial<Record<"off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max", string>>;
 	api?: string;
 	baseUrl?: string;
 	name?: string;
@@ -270,6 +276,56 @@ function validateThinkingLevelMap(value: unknown, path: string, errors: string[]
 	}
 }
 
+function validateModelAliases(value: unknown, path: string, errors: string[]): void {
+	if (value === undefined) return;
+	if (!isObject(value)) {
+		errors.push(`${path} must be an object mapping thinking levels to upstream model IDs`);
+		return;
+	}
+	if (Object.keys(value).length === 0) {
+		errors.push(`${path} must map at least one thinking level`);
+		return;
+	}
+	for (const [level, target] of Object.entries(value)) {
+		if (!THINKING_LEVELS.has(level)) errors.push(`${path} contains an unsupported thinking level`);
+		if (!isNonemptyString(target)) errors.push(`${path}.${level} must be a nonempty model ID`);
+	}
+}
+
+/**
+ * Levels the picker actually offers, mirroring pi's getSupportedThinkingLevels(): a map entry of
+ * null hides a level, xhigh/max are offered only when the map names them, and a model without a
+ * map offers the default ladder when it does reasoning at all.
+ */
+function offeredThinkingLevels(model: JsonObject): string[] {
+	const map = model.thinkingLevelMap;
+	if (!isObject(map)) return model.reasoning === true ? ["off", "minimal", "low", "medium", "high"] : ["off"];
+	return [...THINKING_LEVELS].filter((level) => {
+		const mapped = map[level];
+		if (mapped === null) return false;
+		if (level === "xhigh" || level === "max") return mapped !== undefined;
+		return true;
+	});
+}
+
+/**
+ * Gaps in `modelAliases` are allowed: the resolver substitutes a neighbouring configured variant,
+ * so the request still names a model the relay serves. Warn anyway, because the strength asked for
+ * in /thinking is then not the strength that is sent. "off" is exempt: it means "no thinking" and
+ * legitimately lands on the weakest variant.
+ */
+function warnAliasCoverage(model: JsonObject, modelPath: string, warnings: string[]): void {
+	const aliases = model.modelAliases;
+	if (!isObject(aliases)) return;
+	const gaps = offeredThinkingLevels(model)
+		.filter((level) => level !== "off")
+		.filter((level) => !isNonemptyString(aliases[level]));
+	if (gaps.length === 0) return;
+	warnings.push(
+		`${modelPath}.modelAliases has no entry for ${gaps.join(", ")}; /thinking silently uses a neighbouring configured variant for those levels`,
+	);
+}
+
 function validateInput(value: unknown, path: string, errors: string[]): void {
 	if (value === undefined) return;
 	if (!Array.isArray(value) || value.length === 0) {
@@ -403,6 +459,8 @@ export function validateRelayConfig(value: unknown): { config: RelayConfig; warn
 			validateHeaders(model.headers, `${modelPath}.headers`, errors);
 			validateCompat(model.compat, `${modelPath}.compat`, errors);
 			validateThinkingLevelMap(model.thinkingLevelMap, `${modelPath}.thinkingLevelMap`, errors);
+			validateModelAliases(model.modelAliases, `${modelPath}.modelAliases`, errors);
+			warnAliasCoverage(model, modelPath, warnings);
 		}
 	}
 

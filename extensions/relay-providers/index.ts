@@ -1,8 +1,10 @@
 
 import type { ExtensionAPI, ExtensionContext, ProviderModelConfig } from "@earendil-works/pi-coding-agent";
+import type { Model, SimpleStreamOptions, TranscriptContext } from "@earendil-works/pi-ai";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import { resolveRequestModelId } from "./aliases.ts";
 import {
 	isObject,
 	normalizeQuotaRetry,
@@ -55,6 +57,17 @@ function registerVisibleProviders(
 
 		const api = provider.api ?? "openai-completions";
 		const quotaRetry = normalizeQuotaRetry(provider.quotaRetry);
+		// Pi's provider-level streamSimple sees every request, so each registered model gets a
+		// per-model alias resolver keyed by that model's own registration ID (not request state).
+		const aliasResolvers = new Map<string, (level: string | undefined) => string | undefined>(
+			visibleModels
+				.filter((model) => model.modelAliases !== undefined)
+				.map((model) => {
+					const aliases = model.modelAliases;
+					const baseId = model.id;
+					return [baseId, (level: string | undefined) => resolveRequestModelId(baseId, aliases, level)] as const;
+				}),
+		);
 		pi.registerProvider(provider.id, {
 			name: provider.name ?? provider.id,
 			baseUrl: provider.baseUrl,
@@ -62,9 +75,13 @@ function registerVisibleProviders(
 			api: api as never,
 			authHeader: provider.authHeader ?? OPENAI_BEARER_APIS.has(api),
 			headers: provider.headers,
-			streamSimple: (quotaRetry
-				? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker, api)
-				: createPassThroughStream(api)) as never,
+			streamSimple: ((model: Model<"openai-completions">, context: TranscriptContext, options?: SimpleStreamOptions) => {
+				const resolveModelId = aliasResolvers.get(model.id);
+				const stream = quotaRetry
+					? createQuotaRetryStream(provider.name ?? provider.id, quotaRetry, statusTracker, api, resolveModelId)
+					: createPassThroughStream(api, resolveModelId);
+				return stream(model, context, options);
+			}) as never,
 			models: visibleModels.map((model) => buildModel(model, api, provider.compat)),
 		});
 	}
