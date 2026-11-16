@@ -1,10 +1,73 @@
 import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
 const INLINE_STATUS_KEYS = new Set(["relay-balance", "kimi-usage", "opendesign-usage"]);
 const DEDICATED_ROW_PREFIX = "footer-row-";
 const MAX_LABEL_LENGTH = 48;
+const MARQUEE_TICK_MS = 500;
+const MARQUEE_STEP = 3;
+const MARQUEE_GAP = "   ";
+
+/** Slide an overlong line through a fixed window so the whole title stays readable. */
+export function marqueeWindow(line: string, width: number, offset: number): string {
+	if (width <= 0) return "";
+	if (visibleWidth(line) <= width) return line;
+	const period = visibleWidth(`${line}${MARQUEE_GAP}`);
+	if (period <= width) return line;
+	const doubled = `${line}${MARQUEE_GAP}${line}${MARQUEE_GAP}`;
+	const start = ((offset % period) + period) % period;
+	return sliceByColumn(doubled, start, width, true);
+}
+
+// Zero width and not stripped by the sanitizers, so the producer marks where scrolling must stop.
+const SCROLL_MARKER = "\u200B";
+
+function renderScrollable(fixedHead: string, scrollable: string, fixedTail: string, width: number, offset: number, line: string) {
+	const window = width - visibleWidth(fixedHead) - visibleWidth(fixedTail);
+	if (window <= 0) {
+		return { text: truncateToWidth(line.split(SCROLL_MARKER).join(""), width, ""), scrolling: false };
+	}
+	if (visibleWidth(scrollable) <= window) {
+		return { text: `${fixedHead}${scrollable}${fixedTail}`, scrolling: false };
+	}
+	// A window boundary that falls inside a wide grapheme drops it, so pad back to the exact width;
+	// otherwise the pinned tail would jitter one column left on those frames.
+	const slice = marqueeWindow(scrollable, window, offset);
+	const padding = " ".repeat(Math.max(0, window - visibleWidth(slice)));
+	return { text: `${fixedHead}${slice}${padding}${fixedTail}`, scrolling: true };
+}
+
+/**
+ * A single marker keeps the original convention (`scrolling head` + `fixed tail`). A pair marks
+ * `fixed head` + `scrolling middle` + `fixed tail`, which also pins row numbers.
+ */
+export function renderDedicatedRow(
+	line: string,
+	width: number,
+	offset: number,
+): { text: string; scrolling: boolean } {
+	const firstMarker = line.indexOf(SCROLL_MARKER);
+	if (firstMarker === -1) {
+		const scrolling = visibleWidth(line) > width;
+		return { text: scrolling ? marqueeWindow(line, width, offset) : line, scrolling };
+	}
+
+	const afterFirst = line.slice(firstMarker + SCROLL_MARKER.length);
+	const secondMarker = afterFirst.indexOf(SCROLL_MARKER);
+	if (secondMarker === -1) {
+		return renderScrollable("", line.slice(0, firstMarker), afterFirst, width, offset, line);
+	}
+
+	return renderScrollable(
+		line.slice(0, firstMarker),
+		afterFirst.slice(0, secondMarker),
+		afterFirst.slice(secondMarker + SCROLL_MARKER.length),
+		width,
+		offset,
+		line,
+	);
+}
 
 function stripTerminalStrings(value: string): string {
 	return value
@@ -61,8 +124,30 @@ function sanitizeStatusText(text: string): string {
 function installBalanceFooter(ctx: ExtensionContext): void {
 	ctx.ui.setFooter((tui, theme, footerData) => {
 		const unsub = footerData.onBranchChange(() => tui.requestRender());
+		let marqueeTimer: ReturnType<typeof setInterval> | undefined;
+		let marqueeOffset = 0;
+
+		const startMarquee = () => {
+			if (marqueeTimer) return;
+			marqueeTimer = setInterval(() => {
+				marqueeOffset += MARQUEE_STEP;
+				tui.requestRender();
+			}, MARQUEE_TICK_MS);
+			marqueeTimer.unref?.();
+		};
+
+		const stopMarquee = () => {
+			if (!marqueeTimer) return;
+			clearInterval(marqueeTimer);
+			marqueeTimer = undefined;
+			marqueeOffset = 0;
+		};
+
 		return {
-			dispose: unsub,
+			dispose() {
+				unsub();
+				stopMarquee();
+			},
 			invalidate() {},
 			render(width: number): string[] {
 				const model = ctx.model;
@@ -102,7 +187,9 @@ function installBalanceFooter(ctx: ExtensionContext): void {
 				}
 
 				let statsLeft = leftParts.join(" · ");
-				const modelName = model ? sanitizeExternalText(model.id, 96) || "unnamed-model" : "no-model";
+				// Prefer the configured display name; the footer's purpose is readability, not the wire model id.
+				const modelLabel = model?.name?.trim() || model?.id || "";
+				const modelName = model ? sanitizeExternalText(modelLabel, 96) || "unnamed-model" : "no-model";
 				let statsLeftWidth = visibleWidth(statsLeft);
 				if (statsLeftWidth > width) {
 					statsLeft = truncateToWidth(statsLeft, width, "...");
@@ -119,7 +206,9 @@ function installBalanceFooter(ctx: ExtensionContext): void {
 
 				let rightSide = rightSideWithoutProvider;
 				if (footerData.getAvailableProviderCount() > 1 && model) {
-					const providerName = sanitizeExternalText(model.provider, MAX_LABEL_LENGTH) || "unknown-provider";
+					// Prefer the provider's display name (e.g. "OpenDesign") over its internal id.
+					const providerDisplayName = ctx.modelRegistry?.getProviderDisplayName(model.provider) || model.provider;
+					const providerName = sanitizeExternalText(providerDisplayName, MAX_LABEL_LENGTH) || "unknown-provider";
 					rightSide = `(${providerName}) ${rightSideWithoutProvider}`;
 					if (statsLeftWidth + minPadding + visibleWidth(rightSide) > width) {
 						rightSide = rightSideWithoutProvider;
@@ -159,9 +248,14 @@ function installBalanceFooter(ctx: ExtensionContext): void {
 				if (otherStatuses.length > 0) {
 					lines.push(truncateToWidth(otherStatuses.join(" "), width, theme.fg("dim", "...")));
 				}
+				let scrolling = false;
 				for (const [, text] of statusEntries.filter(([key]) => key.startsWith(DEDICATED_ROW_PREFIX))) {
-					lines.push(truncateToWidth(sanitizeStatusText(text), width, theme.fg("dim", "...")));
+					const rendered = renderDedicatedRow(sanitizeStatusText(text), width, marqueeOffset);
+					if (rendered.scrolling) scrolling = true;
+					lines.push(rendered.text);
 				}
+				if (scrolling) startMarquee();
+				else stopMarquee();
 
 				return lines;
 			},
