@@ -14,6 +14,7 @@
     "extensions/mcp-sanitize/**/*.ts",
     "extensions/opendesign-usage/**/*.ts",
     "extensions/compact-footer/**/*.ts",
+    "extensions/keep-model-on-new/**/*.ts",
     "extensions/kimi-usage/**/*.ts",
     "extensions/relay-balance/**/*.ts",
     "extensions/relay-providers/**/*.ts",
