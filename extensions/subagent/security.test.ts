@@ -1,9 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import test from "node:test";
-import { discoverAgents } from "./agents.ts";
 import { buildChildEnvironment, quoteExactPath, referencedEnvironmentNames, terminalSanitize } from "./security.ts";
 
 test("terminalSanitize removes ANSI, OSC, C0/C1, and bidi controls", () => {
@@ -50,34 +46,4 @@ test("buildChildEnvironment supports selected custom-provider config references"
 		),
 		{ K12_API_KEY: "selected", K12_BASE_URL: "url", RELAY_SECRET: "secret", RELAY_TENANT: "tenant" },
 	);
-});
-
-test("project agent discovery stays within its explicit boundary and ignores escaping symlinks", () => {
-	const root = mkdtempSync(join(tmpdir(), "subagent-security-"));
-	try {
-		const child = join(root, "child");
-		const rootAgents = join(root, ".pi", "agents");
-		const childAgents = join(child, ".pi", "agents");
-		mkdirSync(rootAgents, { recursive: true });
-		mkdirSync(childAgents, { recursive: true });
-		writeFileSync(join(rootAgents, "upward.md"), "---\nname: upward\ndescription: must not load\n---\nroot");
-		writeFileSync(join(childAgents, "inside.md"), "---\nname: inside\ndescription: load\n---\nchild");
-		const outside = join(root, "outside.md");
-		writeFileSync(outside, "---\nname: outside\ndescription: must not load\n---\noutside");
-		try {
-			symlinkSync(outside, join(childAgents, "escape.md"));
-		} catch {
-		}
-
-		const confined = discoverAgents(child, "project", child);
-		assert.deepEqual(confined.agents.map((agent) => agent.name), ["inside"]);
-		assert.equal(confined.projectAgentsDir, childAgents);
-
-		rmSync(childAgents, { recursive: true, force: true });
-		const boundedUpward = discoverAgents(child, "project", root);
-		assert.deepEqual(boundedUpward.agents.map((agent) => agent.name), ["upward"]);
-		assert.equal(boundedUpward.projectAgentsDir, rootAgents);
-	} finally {
-		rmSync(root, { recursive: true, force: true });
-	}
 });

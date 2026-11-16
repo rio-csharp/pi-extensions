@@ -3,23 +3,20 @@ import {
 	type ExtensionAPI,
 	type ExtensionContext,
 } from "@earendil-works/pi-coding-agent";
-import { type AgentConfig, discoverAgents } from "./agents.ts";
 import { loadSubagentConfig } from "./config.ts";
+import { contextWindowFor, knownToolCatalog, parseModelOverride, resolveChildInvocation } from "./invocation.ts";
 import { JobStore, type JobItem } from "./jobs.ts";
-import { getContextModel, isDepthLimitReached, providerEnvNames, runChild } from "./process.ts";
+import { getContextModel, isDepthLimitReached, runChild } from "./process.ts";
 import { SubagentJobsParams, SubagentParams } from "./schema.ts";
-import { quoteExactPath } from "./security.ts";
 import { Semaphore } from "./slots.ts";
 import { createStatusPublisher } from "./status.ts";
-import { PER_TASK_OUTPUT_CAP, boundedMetadata, getFinalOutput, getResultOutput, isFailedResult, sanitizeBounded, truncateTaskOutput } from "./text.ts";
+import { MAX_INSTRUCTION_CHARS, MAX_TASK_CHARS, PER_TASK_OUTPUT_CAP, boundedMetadata, clampTitle, getFinalOutput, getResultOutput, isFailedResult, sanitizeBounded, truncateTaskOutput } from "./text.ts";
 import {
 	renderSupervisorMessage,
 	subagentJobsRenderer,
 	subagentTimelineRenderer,
 } from "./timeline.ts";
 import type { SingleResult, SubagentDetails, SubagentMode } from "./types.ts";
-
-const DEFAULT_AGENT_LABEL = "default";
 
 let lastConfigWarning: string | undefined;
 
@@ -33,15 +30,6 @@ function notifyConfigWarning(ctx: ExtensionContext): void {
 		lastConfigWarning = warning;
 		ctx.ui.notify(warning, "warning");
 	}
-}
-
-function childInvocationArgs(ctx: ExtensionContext) {
-	const provider = ctx.model?.provider;
-	return {
-		model: getContextModel(ctx),
-		provider,
-		providerEnvNames: providerEnvNames(provider, ctx),
-	};
 }
 
 export default function (pi: ExtensionAPI) {
@@ -76,28 +64,26 @@ export default function (pi: ExtensionAPI) {
 			"Batch parallel and sequential chain modes are also supported.",
 			"Completion or interruption is delivered automatically as a steering message and triggers the main agent when idle.",
 			"Use subagent_jobs to steer a running child or inspect, resume, and cancel supervised jobs.",
+			"An explicit model, thinking, or tools override that cannot be honored fails the call instead of falling back silently.",
+			"Omit tools to inherit the child's complete default tool set; pass tools only to deliberately restrict permissions, for example a read-only reviewer.",
+			"Keep every title to 2-5 words and never prefix it with the tool name; it is the whole label in the footer row.",
 		].join(" "),
 		parameters: SubagentParams,
 
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
-			const detailsFor =
-				(mode: SubagentMode, projectAgentsDir: string | null = null) =>
-				(results: SingleResult[]): SubagentDetails => ({
-					mode,
-					agentScope: "user",
-					projectAgentsDir,
-					results,
-				});
+			const detailsFor = (mode: SubagentMode) =>
+				(results: SingleResult[]): SubagentDetails => ({ mode, results });
 
+			const knownTools = knownToolCatalog(pi);
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
-			const invalidBatchTitle = [...(params.chain ?? []), ...(params.tasks ?? [])]
-				.some((item) => !item.title.trim());
-			const hasSingle = Boolean(params.task && params.title?.trim());
+			const invalidBatchItem = [...(params.chain ?? []), ...(params.tasks ?? [])]
+				.some((item) => !item.title?.trim() || !item.task?.trim());
+			const hasSingle = Boolean(params.task?.trim() && params.title?.trim());
 			const incompleteSingle = Boolean(params.task || params.title) && !hasSingle;
 			const modeCount = Number(hasChain) + Number(hasTasks) + Number(hasSingle);
 
-			if (modeCount !== 1 || incompleteSingle || invalidBatchTitle) {
+			if (modeCount !== 1 || incompleteSingle || invalidBatchItem) {
 				return {
 					content: [{
 						type: "text",
@@ -108,26 +94,37 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const mode: SubagentMode = hasChain ? "chain" : hasTasks ? "parallel" : "single";
-			const requested: JobItem[] = hasChain
+			const sourceItems: JobItem[] = hasChain
 				? params.chain!
 				: hasTasks
 					? params.tasks!
 					: [{ title: params.title!, task: params.task!, cwd: params.cwd }];
+			const requested: JobItem[] = sourceItems.map((item) => ({
+				...item,
+				title: clampTitle(item.title),
+				task: item.task.trim(),
+				model: item.model ?? params.model,
+				thinking: item.thinking ?? params.thinking,
+				tools: item.tools ?? params.tools,
+				systemPrompt: item.systemPrompt ?? params.systemPrompt,
+			}));
 
 			notifyConfigWarning(ctx);
 
+			const oversized = requested.find((item) => item.task.length > MAX_TASK_CHARS);
+			if (oversized) {
+				return {
+					content: [{
+						type: "text",
+						text: `Task is too long (${oversized.task.length} characters, max ${MAX_TASK_CHARS}); put it in a file and point the subagent at it instead.`,
+					}],
+					details: detailsFor(mode)([]),
+					isError: true,
+				};
+			}
+
 			if (params.background !== false) {
-				const job = store.start(
-					{
-						mode,
-						agentScope: "user",
-						projectAgentsDir: null,
-						confirmProjectAgents: false,
-						items: requested.map((item) => ({ ...item, title: item.title.trim() })),
-					},
-					[],
-					ctx,
-				);
+				const job = store.start({ mode, items: requested }, ctx);
 				return {
 					content: [{
 						type: "text",
@@ -137,35 +134,45 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// Foreground runs resolve every override before the first child starts, so a bad model or
+			// tool list cannot fail after an earlier step already spent tokens.
+			const invocations = params.background === false
+				? requested.map((item) => resolveChildInvocation(ctx, item, knownTools))
+				: [];
+
 			const runOne = (
 				item: JobItem,
+				index: number,
 				step: number | undefined,
 				taskOnUpdate: ((partial: AgentToolResult<SubagentDetails>) => void) | undefined,
 				makeDetails: (results: SingleResult[]) => SubagentDetails,
 			): Promise<SingleResult> => {
-				const invocation = childInvocationArgs(ctx);
+				const invocation = invocations[index]!;
+				const inheritedModel = invocation.model ?? getContextModel(ctx);
 				const slotSignal = signal ?? new AbortController().signal;
 				return semaphore.with(slotSignal, () =>
 					whileRunning(
-						DEFAULT_AGENT_LABEL,
 						item.title,
 						ctx,
 						(onStatusUpdate) =>
 							runChild({
 								defaultCwd: ctx.cwd,
-								agentName: DEFAULT_AGENT_LABEL,
 								task: item.task,
 								cwd: item.cwd,
 								step,
 								signal,
-								inheritedModel: invocation.model,
+								inheritedModel,
 								provider: invocation.provider,
 								providerEnvNames: invocation.providerEnvNames,
+								thinking: invocation.thinking,
+								tools: invocation.tools,
+								systemPrompt: invocation.systemPrompt,
 								onUpdate: taskOnUpdate,
 								makeDetails,
 								onStatusUpdate,
 							}),
-						invocation.model,
+						inheritedModel,
+						invocation.thinking,
 					),
 				);
 			};
@@ -174,8 +181,8 @@ export default function (pi: ExtensionAPI) {
 				const results: SingleResult[] = [];
 				let previousOutput = "";
 
-				for (let i = 0; i < params.chain!.length; i++) {
-					const step = params.chain![i];
+				for (let i = 0; i < requested.length; i++) {
+					const step = requested[i];
 					const taskWithContext = step.task.replace(/\{previous\}/g, previousOutput);
 
 					const chainUpdate = onUpdate
@@ -190,13 +197,13 @@ export default function (pi: ExtensionAPI) {
 						}
 						: undefined;
 
-					const result = await runOne({ ...step, task: taskWithContext }, i + 1, chainUpdate, detailsFor("chain"));
+					const result = await runOne({ ...step, task: taskWithContext }, i, i + 1, chainUpdate, detailsFor("chain"));
 					results.push(result);
 
 					if (isFailedResult(result)) {
 						const errorMsg = getResultOutput(result);
 						return {
-							content: [{ type: "text", text: `Chain stopped at step ${i + 1} (${boundedMetadata(DEFAULT_AGENT_LABEL)}): ${sanitizeBounded(errorMsg, PER_TASK_OUTPUT_CAP, "Error output truncated")}` }],
+							content: [{ type: "text", text: `Chain stopped at step ${i + 1}: ${sanitizeBounded(errorMsg, PER_TASK_OUTPUT_CAP, "Error output truncated")}` }],
 							details: detailsFor("chain")(results),
 							isError: true,
 						};
@@ -210,12 +217,10 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			if (mode === "parallel") {
-				const tasks = params.tasks!;
+				const tasks = requested;
 				const allResults: SingleResult[] = new Array(tasks.length);
 				for (let i = 0; i < tasks.length; i++) {
 					allResults[i] = {
-						agent: DEFAULT_AGENT_LABEL,
-						agentSource: "unknown",
 						task: tasks[i].task,
 						exitCode: -1, // -1 = still running
 						messages: [],
@@ -236,7 +241,7 @@ export default function (pi: ExtensionAPI) {
 				};
 
 				const results = await Promise.all(tasks.map(async (t, index) => {
-					const result = await runOne(t, undefined, (partial) => {
+					const result = await runOne(t, index, undefined, (partial) => {
 						if (partial.details?.results[0]) {
 							allResults[index] = partial.details.results[0];
 							emitParallelUpdate();
@@ -248,12 +253,12 @@ export default function (pi: ExtensionAPI) {
 				}));
 
 				const successCount = results.filter((r) => !isFailedResult(r)).length;
-				const summaries = results.map((r) => {
+				const summaries = results.map((r, index) => {
 					const output = truncateTaskOutput(getResultOutput(r));
 					const status = isFailedResult(r)
 						? `failed${r.stopReason && r.stopReason !== "end" ? ` (${r.stopReason})` : ""}`
 						: "completed";
-					return `### [${boundedMetadata(r.agent)}] ${boundedMetadata(status)}\n\n${output}`;
+					return `### ${boundedMetadata(tasks[index].title)} ${boundedMetadata(status)}\n\n${output}`;
 				});
 				return {
 					content: [{
@@ -265,7 +270,8 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const result = await runOne(
-				{ title: params.title!, task: params.task!, cwd: params.cwd },
+				requested[0],
+				0,
 				undefined,
 				onUpdate,
 				detailsFor("single"),
@@ -295,11 +301,21 @@ export default function (pi: ExtensionAPI) {
 			"Manage supervised background subagent jobs.",
 			"Use steer to redirect a running child, list/status to inspect without waiting, resume to continue an interrupted child from its persisted session, and cancel to stop it.",
 			"For parallel jobs, steer accepts a zero-based taskIndex; it may be omitted when exactly one child is running.",
+			"Resume accepts optional model, thinking, and tools overrides for every task of the job; they are validated and fail the call when they cannot be honored.",
 			"Status is compact by default. Set includeOutput=true only for bounded diagnostic task output.",
 			"Never poll a running job repeatedly; completion and interruption notifications are automatic.",
 		].join(" "),
 		parameters: SubagentJobsParams,
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+			const resumeOnly = ["model", "thinking", "tools"] as const;
+			if (params.action !== "resume" && resumeOnly.some((field) => params[field] !== undefined)) {
+				return {
+					content: [{ type: "text", text: `model, thinking, and tools overrides are only valid with action=resume; action=${params.action} does not accept them.` }],
+					details: { jobs: [] },
+					isError: true,
+				};
+			}
+
 			if (params.action === "list") {
 				const listed = store.list().slice(0, 50);
 				return {
@@ -341,6 +357,13 @@ export default function (pi: ExtensionAPI) {
 						isError: true,
 					};
 				}
+				if (instruction.length > MAX_INSTRUCTION_CHARS) {
+					return {
+						content: [{ type: "text", text: `Instruction is too long (${instruction.length} characters, max ${MAX_INSTRUCTION_CHARS}).` }],
+						details: store.details(job),
+						isError: true,
+					};
+				}
 				const outcome = await store.steer(job, params.taskIndex, instruction);
 				return {
 					content: [{ type: "text", text: outcome.text }],
@@ -376,64 +399,47 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			if (job.agentScope !== "user") {
-				const executionPaths = [...new Set(job.tasks.map((task) => task.cwd ?? job.defaultCwd))];
-				const quotedExecutionPaths = executionPaths.map(quoteExactPath);
-				if (ctx.mode !== "tui" || !ctx.hasUI) {
-					return {
-						content: [{ type: "text", text: `Cannot resume ${job.id} noninteractively; project-local job path approval is required for: ${quotedExecutionPaths.join(", ")}` }],
-						details: store.details(job),
-						isError: true,
-					};
-				}
-				const approved = await ctx.ui.confirm(
-					"Resume project job at exact path?",
-					`Persisted project-agent source cwd: ${quoteExactPath(job.defaultCwd)}\nPersisted child execution path${quotedExecutionPaths.length === 1 ? "" : "s"}:\n${quotedExecutionPaths.map((value) => `- ${value}`).join("\n")}\n\nThis approval is required on every resume and applies only to this attempt. Project agent files may have changed.`,
+			const switchesModel = params.model !== undefined;
+			if (switchesModel || params.thinking !== undefined || params.tools !== undefined) {
+				const invocation = resolveChildInvocation(
+					ctx,
+					{ model: params.model, thinking: params.thinking, tools: params.tools },
+					knownToolCatalog(pi),
 				);
-				if (!approved) {
-					return {
-						content: [{ type: "text", text: `Canceled resume for ${job.id}; persisted project paths were not approved.` }],
-						details: store.details(job),
-						isError: true,
-					};
-				}
-			}
-			const discovery = discoverAgents(job.defaultCwd, job.agentScope, job.defaultCwd);
-			if (job.agentScope !== "user" && job.confirmProjectAgents && ctx.mode === "tui" && ctx.hasUI) {
-				const projectAgents = [...new Set(job.tasks.map((task) => task.agent).filter((name): name is string => Boolean(name)))]
-					.map((name) => discovery.agents.find((agent) => agent.name === name))
-					.filter((agent): agent is AgentConfig => agent?.source === "project");
-				if (projectAgents.length > 0) {
-					const ok = await ctx.ui.confirm(
-						"Resume project-local agents?",
-						`Agents: ${projectAgents.map((agent) => boundedMetadata(agent.name)).join(", ")}\nSource: ${discovery.projectAgentsDir ? quoteExactPath(discovery.projectAgentsDir) : "(unknown)"}\n\nAgent files may have changed since this job started.`,
-					);
-					if (!ok) {
-						return {
-							content: [{ type: "text", text: `Canceled resume for ${job.id}: project-local agents were not approved.` }],
-							details: store.details(job),
-							isError: true,
-						};
+				if (switchesModel) {
+					const targetModel = invocation.model ?? getContextModel(ctx);
+					const contextWindow = targetModel ? contextWindowFor(ctx, targetModel) : undefined;
+					if (contextWindow !== undefined) {
+						for (const [index, task] of job.tasks.entries()) {
+							const used = task.contextTokens ?? task.result?.usage.contextTokens ?? 0;
+							if (used > contextWindow) {
+								return {
+									content: [{
+										type: "text",
+										text: `Cannot resume ${job.id} on ${targetModel}: task ${index + 1} (${boundedMetadata(task.title)}) last used ${used} context tokens and ${targetModel} has a context window of ${contextWindow} tokens. Start a fresh subagent instead of resuming this job.`,
+									}],
+									details: store.details(job),
+									isError: true,
+								};
+							}
+						}
 					}
+					for (const task of job.tasks) task.model = targetModel;
 				}
-			}
-			const missing = job.tasks
-				.map((task) => task.agent)
-				.filter((name): name is string => Boolean(name))
-				.filter((name) => !discovery.agents.some((agent) => agent.name === name));
-			if (missing.length > 0) {
-				return {
-					content: [{ type: "text", text: `Cannot resume ${job.id}; missing agents: ${[...new Set(missing)].join(", ")}` }],
-					details: store.details(job),
-					isError: true,
-				};
+				if (params.thinking !== undefined || (params.model && parseModelOverride(params.model).thinking !== undefined)) {
+					for (const task of job.tasks) task.thinking = invocation.thinking;
+				}
+				if (params.tools !== undefined) {
+					for (const task of job.tasks) task.tools = invocation.tools;
+				}
 			}
 
-			store.resume(job, discovery.agents, ctx, params.instruction);
+			store.resume(job, ctx, params.instruction);
+			const models = [...new Set(job.tasks.map((task) => task.model ?? "the inherited parent model"))];
 			return {
 				content: [{
 					type: "text",
-					text: `Resumed ${job.id} from its persisted child session(s). Return to the user now; completion/interruption notification is automatic.`,
+					text: `Resumed ${job.id} from its persisted child session(s) using ${models.join(", ")}. Return to the user now; completion/interruption notification is automatic.`,
 				}],
 				details: store.details(job),
 			};

@@ -6,7 +6,6 @@ import { StringDecoder } from "node:string_decoder";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
 import type { Message } from "@earendil-works/pi-ai";
 import { type ExtensionContext, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
-import type { AgentConfig } from "./agents.ts";
 import { buildChildEnvironment, referencedEnvironmentNames, terminalSanitize } from "./security.ts";
 import {
 	RESULT_DIAGNOSTIC_CAP,
@@ -51,24 +50,16 @@ export function getContextModel(ctx: ExtensionContext): string | undefined {
 	return ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
 }
 
-export function selectedProvider(agents: AgentConfig[], agentName: string | undefined, ctx: ExtensionContext): string | undefined {
-	const configuredModel = agentName ? agents.find((agent) => agent.name === agentName)?.model : undefined;
-	if (!configuredModel) return ctx.model?.provider;
-	if (configuredModel.includes("/")) return configuredModel.split("/", 1)[0];
-	const modelId = configuredModel.replace(/:(?:off|minimal|low|medium|high|xhigh|max)$/, "");
-	const matchingProviders = [...new Set(ctx.modelRegistry.getAll().filter((model) => model.id === modelId).map((model) => model.provider))];
-	return matchingProviders.length === 1 ? matchingProviders[0] : ctx.model?.provider;
-}
-
-export function providerEnvNames(provider: string | undefined, ctx: ExtensionContext): string[] {
+export function providerEnvNames(provider: string | undefined, ctx: Pick<ExtensionContext, "modelRegistry">): string[] {
 	if (!provider) return [];
 	return referencedEnvironmentNames(ctx.modelRegistry.getRegisteredProviderConfig(provider));
 }
 
-async function writePromptToTempFile(agentName: string, prompt: string): Promise<{ dir: string; filePath: string }> {
+const PROMPT_FILE_LABEL = "subagent";
+
+async function writePromptToTempFile(prompt: string): Promise<{ dir: string; filePath: string }> {
 	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const safeName = agentName.replace(/[^\w.-]+/g, "_");
-	const filePath = path.join(tmpDir, `prompt-${safeName}.md`);
+	const filePath = path.join(tmpDir, `prompt-${PROMPT_FILE_LABEL}.md`);
 	await withFileMutationQueue(filePath, async () => {
 		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
 	});
@@ -96,8 +87,6 @@ export interface ChildControl {
 
 export interface RunChildOptions {
 	defaultCwd: string;
-	agent?: AgentConfig;
-	agentName: string;
 	task: string;
 	cwd?: string;
 	step?: number;
@@ -106,6 +95,9 @@ export interface RunChildOptions {
 	inheritedModel?: string | null;
 	provider?: string;
 	providerEnvNames?: readonly string[];
+	thinking?: string;
+	tools?: string[];
+	systemPrompt?: string;
 	onUpdate?: (partial: AgentToolResult<SubagentDetails>) => void;
 	makeDetails: (results: SingleResult[]) => SubagentDetails;
 	onStatusUpdate?: (result: SingleResult) => void;
@@ -129,22 +121,22 @@ function finalOutput(messages: Message[]): string {
 }
 
 export async function runChild(options: RunChildOptions): Promise<SingleResult> {
-	const { agent, agentName, task } = options;
+	const { task } = options;
 
 	const args: string[] = ["--mode", "rpc"];
 	if (options.sessionId) args.push("--session-id", options.sessionId);
 	else args.push("--no-session");
 
-	const selectedModel = options.inheritedModel === null ? undefined : options.inheritedModel ?? agent?.model;
+	const selectedModel = options.inheritedModel ?? undefined;
 	if (selectedModel) args.push("--model", selectedModel);
-	if (agent?.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
+	if (options.thinking) args.push("--thinking", options.thinking);
+	const selectedTools = options.tools && options.tools.length > 0 ? options.tools : undefined;
+	if (selectedTools && selectedTools.length > 0) args.push("--tools", selectedTools.join(","));
 
 	let tmpPromptDir: string | null = null;
 	let tmpPromptPath: string | null = null;
 
 	const result: SingleResult = {
-		agent: agentName,
-		agentSource: agent?.source ?? "default",
 		task,
 		exitCode: 0,
 		messages: [],
@@ -163,8 +155,8 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 	};
 
 	try {
-		if (agent?.systemPrompt.trim()) {
-			const tmp = await writePromptToTempFile(agent.name, agent.systemPrompt);
+		if (options.systemPrompt?.trim()) {
+			const tmp = await writePromptToTempFile(options.systemPrompt.trim());
 			tmpPromptDir = tmp.dir;
 			tmpPromptPath = tmp.filePath;
 			args.push("--append-system-prompt", tmpPromptPath);

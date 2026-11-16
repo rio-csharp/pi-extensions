@@ -8,17 +8,44 @@ const STATUS_KEY_PREFIX = "footer-row-subagent-";
 const STATUS_SUMMARY_KEY = `${STATUS_KEY_PREFIX}summary`;
 const STATUS_TICK_MS = 1000;
 const MAX_STATUS_ROWS = 5;
+// Zero width, not stripped by sanitizers: the footer scrolls only the text before it.
+const SCROLL_MARKER = "\u200B";
 
 interface RunningSubagent {
-	agent: string;
 	title: string;
 	startedAt: number;
 	usage: UsageStats;
 	model?: string;
+	thinking?: string;
 }
 
 function statusKey(runId: number): string {
 	return `${STATUS_KEY_PREFIX}${runId.toString().padStart(6, "0")}`;
+}
+
+/** `provider/model-id` becomes `provider/model name`, which is shorter and reads better. */
+export function modelLabel(ctx: ExtensionContext, reference: string | undefined): string | undefined {
+	if (!reference) return undefined;
+	const slashIndex = reference.indexOf("/");
+	if (slashIndex <= 0) return reference;
+	const provider = reference.slice(0, slashIndex);
+	const name = ctx.modelRegistry.find(provider, reference.slice(slashIndex + 1))?.name?.trim();
+	return name ? `${provider}/${name}` : reference;
+}
+
+/** Everything after the scrolling title: model name, thinking level, timing, tokens, cost. */
+export function formatStatusTail(entry: RunningSubagent): string {
+	const usage = entry.usage;
+	return [
+		entry.model ? terminalSanitize(entry.model) : undefined,
+		entry.thinking,
+		formatStartTime(entry.startedAt),
+		formatRunningElapsed(entry.startedAt),
+		`↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} R${formatTokens(usage.cacheRead)}`,
+		`$${usage.cost.toFixed(4)}`,
+	]
+		.filter((part): part is string => Boolean(part))
+		.join(" · ");
 }
 
 function formatStartTime(startedAt: number): string {
@@ -57,18 +84,11 @@ export function createStatusPublisher(pi: ExtensionAPI) {
 		for (const [index, [runId, entry]] of visible.entries()) {
 			const key = statusKey(runId);
 			desiredKeys.add(key);
-			const usage = entry.usage;
-			const tokenStats = `↑${formatTokens(usage.input)} ↓${formatTokens(usage.output)} R${formatTokens(usage.cacheRead)}`;
-			const parts = [
-				`${index + 1}: ${terminalSanitize(entry.title)}`,
-				terminalSanitize(entry.agent),
-				entry.model ? terminalSanitize(entry.model) : undefined,
-				formatStartTime(entry.startedAt),
-				formatRunningElapsed(entry.startedAt),
-				tokenStats,
-				`$${usage.cost.toFixed(4)}`,
-			].filter((part): part is string => Boolean(part));
-			ctx.ui.setStatus(key, ctx.ui.theme.fg("accent", parts.join(" · ")));
+			const head = terminalSanitize(entry.title);
+			const tail = formatStatusTail(entry);
+			const rowNumber = `${index + 1}: `;
+			const row = tail ? `${rowNumber}${SCROLL_MARKER}${head}${SCROLL_MARKER} · ${tail}` : `${rowNumber}${head}`;
+			ctx.ui.setStatus(key, ctx.ui.theme.fg("accent", row));
 		}
 
 		if (hiddenCount > 0) {
@@ -91,19 +111,19 @@ export function createStatusPublisher(pi: ExtensionAPI) {
 	};
 
 	const whileRunning = async <T>(
-		agentName: string,
 		title: string | undefined,
 		ctx: ExtensionContext,
 		run: (onStatusUpdate: (result: SingleResult) => void) => Promise<T>,
 		model?: string,
+		thinking?: string,
 	): Promise<T> => {
 		const runId = nextRunId++;
 		const runGeneration = generation;
 		running.set(runId, {
-			agent: terminalSanitize(agentName),
-			title: terminalSanitize(title?.trim() || agentName),
+			title: terminalSanitize(title?.trim() || "subagent"),
 			startedAt: Date.now(),
-			model: model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined),
+			model: modelLabel(ctx, model ?? (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined)),
+			thinking,
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
 		});
 		publish(ctx);
@@ -115,7 +135,7 @@ export function createStatusPublisher(pi: ExtensionAPI) {
 			const entry = running.get(runId);
 			if (!entry) return;
 			entry.usage = { ...result.usage };
-			entry.model = effectiveModel(result.provider, result.model) ?? entry.model;
+			entry.model = modelLabel(ctx, effectiveModel(result.provider, result.model)) ?? entry.model;
 			publish(ctx);
 		};
 

@@ -1,5 +1,4 @@
 import type { Message } from "@earendil-works/pi-ai";
-import type { AgentScope } from "./agents.ts";
 
 export interface UsageStats {
 	input: number;
@@ -12,8 +11,6 @@ export interface UsageStats {
 }
 
 export interface SingleResult {
-	agent: string;
-	agentSource: "user" | "project" | "default" | "unknown";
 	task: string;
 	exitCode: number;
 	messages: Message[];
@@ -32,7 +29,6 @@ export type BackgroundJobStatus = "running" | "canceling" | "completed" | "faile
 export type SubagentJobTaskState = "succeeded" | "failed" | "pending" | "running";
 
 export interface SubagentJobTaskDetails {
-	agent: string;
 	title: string;
 	sessionId: string;
 	attempts: number;
@@ -43,8 +39,6 @@ export interface SubagentJobTaskDetails {
 
 export interface SubagentDetails {
 	mode: SubagentMode;
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
 	results: SingleResult[];
 	background?: boolean;
 	jobId?: string;

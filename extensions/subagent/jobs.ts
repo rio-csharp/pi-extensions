@@ -1,9 +1,10 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { type AgentConfig, type AgentScope } from "./agents.ts";
-import { type ChildControl, getContextModel, providerEnvNames, runChild, selectedProvider } from "./process.ts";
+import { knownToolCatalog, resolveChildInvocation } from "./invocation.ts";
+import { type ChildControl, getContextModel, providerEnvNames, runChild } from "./process.ts";
 import type { Semaphore } from "./slots.ts";
 import {
+	PERSISTED_SYSTEM_PROMPT_CAP,
 	PERSISTED_TASK_OUTPUT_CAP,
 	RESULT_DETAILS_DIAGNOSTIC_TOTAL_CAP,
 	RESULT_DIAGNOSTIC_CAP,
@@ -34,10 +35,13 @@ const MAX_LISTED_JOBS = 50;
 const MAX_LISTED_FAILURES = 5;
 
 export interface JobItem {
-	agent?: string;
 	title: string;
 	task: string;
 	cwd?: string;
+	model?: string;
+	thinking?: string;
+	tools?: string[];
+	systemPrompt?: string;
 }
 
 interface JobTask extends JobItem {
@@ -46,17 +50,15 @@ interface JobTask extends JobItem {
 	completed: boolean;
 	output?: string;
 	result?: SingleResult;
-	model?: string;
+	/** Last recorded context size, persisted so the resume guard also works after a restart. */
+	contextTokens?: number;
 	control?: ChildControl;
 }
 
 export interface BackgroundJob {
 	id: string;
 	mode: SubagentMode;
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
 	defaultCwd: string;
-	confirmProjectAgents: boolean;
 	tasks: JobTask[];
 	status: BackgroundJobStatus;
 	startedAt: number;
@@ -69,11 +71,8 @@ export interface BackgroundJob {
 interface PersistedJobDefinition {
 	id: string;
 	mode: SubagentMode;
-	agentScope: AgentScope;
-	projectAgentsDir: string | null;
 	defaultCwd: string;
-	confirmProjectAgents: boolean;
-	tasks: Array<Pick<JobTask, "agent" | "title" | "task" | "cwd" | "sessionId" | "model">>;
+	tasks: Array<Pick<JobTask, "title" | "task" | "cwd" | "sessionId" | "model" | "thinking" | "tools" | "systemPrompt">>;
 	startedAt: number;
 }
 
@@ -87,6 +86,7 @@ interface PersistedJobState {
 		completed: boolean;
 		output?: string | null;
 		model?: string;
+		contextTokens?: number;
 	};
 }
 
@@ -97,11 +97,11 @@ export class JobStore {
 	private readonly pi: ExtensionAPI;
 	private readonly semaphore: Semaphore;
 	private readonly whileRunning: <T>(
-		agentName: string,
 		title: string | undefined,
 		ctx: ExtensionContext,
 		run: (onStatusUpdate: (result: SingleResult) => void) => Promise<T>,
 		model?: string,
+		thinking?: string,
 	) => Promise<T>;
 
 	constructor(
@@ -125,42 +125,44 @@ export class JobStore {
 	start(
 		init: {
 			mode: SubagentMode;
-			agentScope: AgentScope;
-			projectAgentsDir: string | null;
-			confirmProjectAgents: boolean;
 			items: JobItem[];
 		},
-		agents: AgentConfig[],
 		ctx: ExtensionContext,
 	): BackgroundJob {
 		const jobId = `sub-${randomUUID()}`;
+		const knownTools = knownToolCatalog(this.pi);
 		const job: BackgroundJob = {
 			id: jobId,
 			runtimeGeneration: this.generation,
 			mode: init.mode,
-			agentScope: init.agentScope,
-			projectAgentsDir: init.projectAgentsDir,
 			defaultCwd: ctx.cwd,
-			confirmProjectAgents: init.confirmProjectAgents,
-			tasks: init.items.map((item, index) => ({
-				...item,
-				sessionId: `${jobId}-${index + 1}`,
-				attempts: 0,
-				completed: false,
-				model: agents.find((agent) => agent.name === item.agent)?.model ?? getContextModel(ctx),
-			})),
+			tasks: init.items.map((item, index) => {
+				const invocation = resolveChildInvocation(ctx, item, knownTools);
+				return {
+					...item,
+					sessionId: `${jobId}-${index + 1}`,
+					attempts: 0,
+					completed: false,
+					model: invocation.model ?? getContextModel(ctx),
+					thinking: invocation.thinking,
+					tools: invocation.tools,
+					systemPrompt: invocation.systemPrompt,
+				};
+			}),
 			status: "interrupted",
 			startedAt: Date.now(),
 		};
 		this.jobs.set(job.id, job);
 		this.persistDefinition(job);
 		this.persistState(job);
-		job.completion = this.run(job, agents, ctx);
+		job.completion = this.run(job, ctx);
 		return job;
 	}
 
-	resume(job: BackgroundJob, agents: AgentConfig[], ctx: ExtensionContext, continuation?: string): void {
-		job.completion = this.run(job, agents, ctx, continuation);
+	resume(job: BackgroundJob, ctx: ExtensionContext, continuation?: string): void {
+		this.persistDefinition(job);
+		for (let index = 0; index < job.tasks.length; index++) this.persistState(job, index);
+		job.completion = this.run(job, ctx, continuation);
 	}
 
 	cancel(job: BackgroundJob): void {
@@ -185,10 +187,7 @@ export class JobStore {
 				this.jobs.set(data.id, {
 					id: data.id,
 					mode: data.mode,
-					agentScope: data.agentScope,
-					projectAgentsDir: data.projectAgentsDir,
 					defaultCwd: data.defaultCwd,
-					confirmProjectAgents: data.confirmProjectAgents,
 					tasks: data.tasks.map((task) => ({ ...task, attempts: 0, completed: false })),
 					status: "interrupted",
 					startedAt: data.startedAt,
@@ -210,6 +209,7 @@ export class JobStore {
 						if (data.task.output === null) delete task.output;
 						else if (data.task.output !== undefined) task.output = data.task.output;
 						if (data.task.model !== undefined) task.model = data.task.model;
+						if (data.task.contextTokens !== undefined) task.contextTokens = data.task.contextTokens;
 					}
 				}
 			}
@@ -269,11 +269,17 @@ export class JobStore {
 		const persisted: PersistedJobDefinition = {
 			id: job.id,
 			mode: job.mode,
-			agentScope: job.agentScope,
-			projectAgentsDir: job.projectAgentsDir,
 			defaultCwd: job.defaultCwd,
-			confirmProjectAgents: job.confirmProjectAgents,
-			tasks: job.tasks.map(({ agent, title, task, cwd, sessionId, model }) => ({ agent, title, task, cwd, sessionId, model })),
+			tasks: job.tasks.map(({ title, task, cwd, sessionId, model, thinking, tools, systemPrompt }) => ({
+				title,
+				task,
+				cwd,
+				sessionId,
+				model,
+				thinking,
+				tools: tools && tools.length > 0 ? [...tools] : undefined,
+				systemPrompt: systemPrompt ? truncateUtf8(systemPrompt, PERSISTED_SYSTEM_PROMPT_CAP, "System prompt truncated") : undefined,
+			})),
 			startedAt: job.startedAt,
 		};
 		this.pi.appendEntry(JOB_DEFINITION_ENTRY_TYPE, persisted);
@@ -293,6 +299,7 @@ export class JobStore {
 					completed: task.completed,
 					output: task.output ?? null,
 					model: task.model,
+					contextTokens: task.result?.usage.contextTokens ?? task.contextTokens,
 				}
 				: undefined,
 		};
@@ -327,7 +334,6 @@ export class JobStore {
 				messages: [],
 				stderr: hasErrorMessage ? "" : diagnostic,
 				errorMessage: hasErrorMessage ? diagnostic : undefined,
-				agent: boundedMetadata(result.agent),
 				provider: result.provider ? boundedMetadata(result.provider) : undefined,
 				model: result.model ? boundedMetadata(result.model) : undefined,
 			});
@@ -338,8 +344,6 @@ export class JobStore {
 	details(job: BackgroundJob): SubagentDetails {
 		return {
 			mode: job.mode,
-			agentScope: job.agentScope,
-			projectAgentsDir: job.projectAgentsDir ? boundedMetadata(job.projectAgentsDir, 2 * 1024) : null,
 			results: this.jobResults(job),
 			background: true,
 			jobId: job.id,
@@ -347,7 +351,6 @@ export class JobStore {
 			startedAt: job.startedAt,
 			finishedAt: job.finishedAt,
 			tasks: job.tasks.map((task) => ({
-				agent: boundedMetadata(task.agent ?? "default"),
 				title: boundedMetadata(task.title),
 				sessionId: boundedMetadata(task.sessionId),
 				attempts: task.attempts,
@@ -375,7 +378,7 @@ export class JobStore {
 		const failures = job.tasks.filter((task) => this.taskState(job, task) === "failed");
 		for (const [index, task] of failures.slice(0, MAX_LISTED_FAILURES).entries()) {
 			const diagnostic = compactDiagnostic(task.output ?? task.result?.errorMessage ?? task.result?.stderr);
-			lines.push(`failure ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent ?? "default")})${diagnostic ? ` · ${diagnostic}` : ""}`);
+			lines.push(`failure ${index + 1}: ${boundedMetadata(task.title)}${diagnostic ? ` · ${diagnostic}` : ""}`);
 		}
 		if (failures.length > MAX_LISTED_FAILURES) lines.push(`failures: +${failures.length - MAX_LISTED_FAILURES} more`);
 
@@ -383,7 +386,7 @@ export class JobStore {
 			lines.push("", `Task output (opt-in; redacted; max ${STATUS_DETAIL_OUTPUT_CAP / 1024} KB per task, ${STATUS_DETAIL_TOTAL_CAP / 1024} KB total):`);
 			for (const [index, task] of job.tasks.entries()) {
 				if (!task.output) continue;
-				lines.push(`\n### task ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent ?? "default")}) · ${this.taskState(job, task)}`);
+				lines.push(`\n### task ${index + 1}: ${boundedMetadata(task.title)} · ${this.taskState(job, task)}`);
 				lines.push(sanitizeBounded(task.output, STATUS_DETAIL_OUTPUT_CAP, "Task output truncated"));
 			}
 			return truncateUtf8(lines.join("\n"), STATUS_DETAIL_TOTAL_CAP, "Detailed status truncated");
@@ -448,7 +451,7 @@ export class JobStore {
 				"",
 				"Completed task outputs (bounded for the parent model):",
 				...job.tasks.map((task, index) =>
-					`\n### task ${index + 1}: ${boundedMetadata(task.title)} (${boundedMetadata(task.agent ?? "default")}) · ${this.taskState(job, task)}\n${truncateTaskOutput(task.output ?? "(no output)")}`,
+					`\n### task ${index + 1}: ${boundedMetadata(task.title)} · ${this.taskState(job, task)}\n${truncateTaskOutput(task.output ?? "(no output)")}`,
 				),
 			].join("\n"),
 			SUPERVISOR_MESSAGE_CAP,
@@ -465,9 +468,10 @@ export class JobStore {
 		);
 	}
 
-	private async run(job: BackgroundJob, agents: AgentConfig[], ctx: ExtensionContext, continuation?: string): Promise<void> {
+	private async run(job: BackgroundJob, ctx: ExtensionContext, continuation?: string): Promise<void> {
 		if (job.status === "running") return;
 		const runGeneration = this.generation;
+		const knownTools = knownToolCatalog(this.pi);
 		job.status = "running";
 		job.finishedAt = undefined;
 		job.runtimeGeneration = runGeneration;
@@ -483,26 +487,22 @@ export class JobStore {
 				task.output = undefined;
 				task.result = undefined;
 				task.control = undefined;
-				const agent = task.agent ? agents.find((a) => a.name === task.agent) : undefined;
 				if (!isPersistedResume) {
-					task.model ??= agent?.model ?? getContextModel(ctx);
+					task.model ??= resolveChildInvocation(ctx, task, knownTools).model ?? getContextModel(ctx);
 				}
 				if (!this.isJobRuntimeCurrent(job, runGeneration)) throw new Error("Subagent runtime was retired");
 				this.persistState(job, index);
 				const selectedModel = isPersistedResume && !task.model ? null : task.model;
 				const provider = selectedModel?.includes("/")
 					? selectedModel.split("/", 1)[0]
-					: selectedProvider(agents, task.agent, ctx);
+					: ctx.model?.provider;
 				const result = await this.semaphore.with(controller.signal, () =>
 					this.whileRunning(
-						task.agent ?? "default",
 						task.title,
 						ctx,
 						(onStatusUpdate) =>
 							runChild({
 								defaultCwd: job.defaultCwd,
-								agent,
-								agentName: task.agent ?? "default",
 								task: prompt,
 								cwd: task.cwd,
 								step: job.mode === "chain" ? index + 1 : undefined,
@@ -511,6 +511,9 @@ export class JobStore {
 								inheritedModel: selectedModel,
 								provider,
 								providerEnvNames: providerEnvNames(provider, ctx),
+								thinking: task.thinking,
+								tools: task.tools,
+								systemPrompt: task.systemPrompt,
 								makeDetails: (results) => ({ ...this.details(job), results }),
 								onStatusUpdate: (updated) => {
 									if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
@@ -527,10 +530,12 @@ export class JobStore {
 								},
 							}),
 						task.model,
+						task.thinking,
 					),
 				);
 				if (!this.isJobRuntimeCurrent(job, runGeneration)) return result;
 				task.result = result;
+				task.contextTokens = result.usage.contextTokens;
 				task.output = sanitizeBounded(getResultOutput(result), PERSISTED_TASK_OUTPUT_CAP, "Persisted task output truncated");
 				task.model = effectiveModel(result.provider, result.model) ?? task.model;
 				task.completed = !isFailedResult(result);

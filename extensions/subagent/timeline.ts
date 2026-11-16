@@ -1,8 +1,7 @@
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import { Text, type Component } from "@earendil-works/pi-tui";
-import type { AgentScope } from "./agents.ts";
 import { terminalSanitize } from "./security.ts";
-import { formatClock, formatElapsed, formatTokens, isFailedResult } from "./text.ts";
+import { effectiveModel, formatClock, formatElapsed, formatTokens, isFailedResult } from "./text.ts";
 import type {
 	BackgroundJobStatus,
 	SingleResult,
@@ -36,13 +35,12 @@ interface TimelineRenderContext {
 }
 
 interface SubagentArgs {
-	agent?: string;
 	title?: string;
 	task?: string;
+	model?: string;
 	background?: boolean;
-	agentScope?: AgentScope;
-	tasks?: Array<{ agent?: string; title: string; task: string }>;
-	chain?: Array<{ agent?: string; title: string; task: string }>;
+	tasks?: Array<{ title: string; task: string; model?: string }>;
+	chain?: Array<{ title: string; task: string; model?: string }>;
 }
 
 class EmptyComponent implements Component {
@@ -73,17 +71,17 @@ function summarizeTitles(items: Array<{ title: string }> | undefined): string {
 }
 
 function describeStart(args: SubagentArgs): string {
-	const scope = terminalSanitize(String(args.agentScope ?? "user"));
 	if (args.chain?.length) {
 		const titles = summarizeTitles(args.chain);
-		return `chain · ${args.chain.length} steps${titles ? ` · ${titles}` : ""} · ${scope}`;
+		return `chain · ${args.chain.length} steps${titles ? ` · ${titles}` : ""}`;
 	}
 	if (args.tasks?.length) {
 		const titles = summarizeTitles(args.tasks);
-		return `parallel · ${args.tasks.length} tasks${titles ? ` · ${titles}` : ""} · ${scope}`;
+		return `parallel · ${args.tasks.length} tasks${titles ? ` · ${titles}` : ""}`;
 	}
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${terminalSanitize(args.agent ?? "default")} · ${scope}`;
+	const model = terminalSanitize(args.model ?? "");
+	return `${title}${model ? ` · ${model}` : ""}`;
 }
 
 function aggregateUsage(results: SingleResult[]): UsageStats {
@@ -140,7 +138,8 @@ function describeFinish(args: SubagentArgs, details: SubagentDetails | undefined
 
 	const result = details.results[0];
 	const title = compactTitle(args.title, compactTitle(args.task, "untitled task"));
-	return `${title} · ${terminalSanitize(result?.agent ?? args.agent ?? "default")}`;
+	const model = terminalSanitize(effectiveModel(result?.provider, result?.model) ?? "");
+	return `${title}${model ? ` · ${model}` : ""}`;
 }
 
 function classifyOutcome(
@@ -153,7 +152,7 @@ function classifyOutcome(
 	if (/^Canceled:/i.test(text) || details?.jobStatus === "canceled") return "canceled";
 	if (context.isError || details?.results.some(isFailedResult)) return "failed";
 	if (details?.jobStatus === "failed" || details?.jobStatus === "interrupted") return "failed";
-	if (/^(Invalid parameters|Unknown agents|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
+	if (/^(Invalid parameters|Agent .*failed|Chain stopped)/i.test(text)) return "failed";
 	return "completed";
 }
 

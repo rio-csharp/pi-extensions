@@ -7,9 +7,20 @@ export const SUPERVISOR_MESSAGE_CAP = 50 * 1024;
 export const STATUS_DETAIL_OUTPUT_CAP = 4 * 1024;
 export const STATUS_DETAIL_TOTAL_CAP = 20 * 1024;
 export const PERSISTED_TASK_OUTPUT_CAP = 50 * 1024;
+export const PERSISTED_SYSTEM_PROMPT_CAP = 8 * 1024;
 export const RESULT_DIAGNOSTIC_CAP = 4 * 1024;
 export const RESULT_DETAILS_DIAGNOSTIC_TOTAL_CAP = 20 * 1024;
 export const RESULT_METADATA_FIELD_CAP = 512;
+export const TITLE_CAP = 160;
+export const MAX_TASK_CHARS = 200_000;
+export const MAX_INSTRUCTION_CHARS = 200_000;
+
+/** Titles are persisted and rendered, so an over-long one is trimmed here instead of rejected by the schema. */
+export function clampTitle(value: string | undefined): string {
+	const trimmed = (value ?? "").trim().replace(/\s+/g, " ");
+	const characters = Array.from(trimmed);
+	return characters.length <= TITLE_CAP ? trimmed : characters.slice(0, TITLE_CAP).join("").trimEnd();
+}
 
 export function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
