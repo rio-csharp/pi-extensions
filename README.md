@@ -6,6 +6,7 @@ Standalone extensions for the [pi coding agent](https://github.com/earendil-work
 
 - [compact-footer](extensions/compact-footer/) — one-line status footer (pure renderer)
 - [compact-tool-ui](extensions/compact-tool-ui/) — compact tool-call and thinking rendering
+- [imagegen](extensions/imagegen/) — `generate_image` text-to-image and image editing tool
 - [keep-model-on-new](extensions/keep-model-on-new/) — carries the active model into `/new` sessions
 - [kimi-usage](extensions/kimi-usage/) — built-in Kimi usage percentages as a status
 - [mcp-sanitize](extensions/mcp-sanitize/) — strips hostile characters from built-in MCP tool results

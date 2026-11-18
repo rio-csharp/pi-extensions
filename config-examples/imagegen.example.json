@@ -1,0 +1,21 @@
+{
+  "provider": "your-relay-provider-id",
+  "defaultModel": "flare",
+  "defaultQuality": "medium",
+  "defaultSize": "1024x1024",
+  "pricePerImage": 0.02,
+  "outputDir": "generated",
+  "timeoutSeconds": 900,
+  "models": {
+    "flare": {
+      "id": "gpt-image-2.6-flare",
+      "description": "Fast iteration: quicker and better at finished-looking layout; use it for drafts, variants and anything a user is waiting on.",
+      "quality": "medium"
+    },
+    "sunburst": {
+      "id": "gpt-image-2.6-sunburst",
+      "description": "Slower but more literal: honors requested element placement, keeps finer detail and drifts less across multi-round edits; use it for final assets and careful edits.",
+      "quality": "high"
+    }
+  }
+}
