@@ -45,9 +45,8 @@ function sanitizeValue(value: unknown): unknown {
 	if (typeof value === "string") return sanitizeText(value);
 	if (Array.isArray(value)) return value.map(sanitizeValue);
 	if (value !== null && typeof value === "object") {
-		const result: Record<string, unknown> = {};
-		for (const [key, entry] of Object.entries(value)) result[key] = sanitizeValue(entry);
-		return result;
+		// Define own data properties without invoking inherited setters such as __proto__.
+		return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, sanitizeValue(entry)]));
 	}
 	return value;
 }

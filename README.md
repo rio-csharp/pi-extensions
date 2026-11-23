@@ -14,6 +14,7 @@ Standalone extensions for the [pi coding agent](https://github.com/earendil-work
 - [relay-balance](extensions/relay-balance/) — active relay provider's balance as a status
 - [relay-providers](extensions/relay-providers/) — registers providers/models from local config
 - [subagent](extensions/subagent/) — background pi subprocesses with supervision
+- [tps-stats](extensions/tps-stats/) — session average output speed and time-to-first-token as a status
 - [web](extensions/web/) — configurable web_search / web_fetch tools
 
 Example configs live in [config-examples](config-examples/).

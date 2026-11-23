@@ -175,6 +175,12 @@ test("imageCostUsd bills per image", () => {
 	assert.equal(imageCostUsd(Number.NaN, 1), 0);
 });
 
+test("normalizes only the path of a base URL with query parameters", () => {
+	withAgentDir({ "imagegen.json": { baseUrl: "https://example.com/v1///?route=blue/" } }, (dir) => {
+		assert.equal(loadImageGenConfig(dir).baseUrl, "https://example.com/v1?route=blue/");
+	});
+});
+
 test("rejects credential-bearing base URLs", () => {
 	withAgentDir({ "imagegen.json": { baseUrl: "https://user:pass@example.com/v1" } }, (dir) => {
 		const config = loadImageGenConfig(dir);

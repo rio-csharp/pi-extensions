@@ -1,5 +1,10 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import dns from "node:dns/promises";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import test, { after, before, mock } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import webExtension from "./index.ts";
 
@@ -9,6 +14,26 @@ type Tool = {
 };
 
 type Response = { status?: number; location?: string; body?: string; stderr?: string; code?: number };
+
+let configDir: string;
+let configFile: string;
+const priorAgentDir = process.env.PI_CODING_AGENT_DIR;
+before(() => {
+	configDir = mkdtempSync(join(tmpdir(), "web-security-"));
+	configFile = join(configDir, "web.json");
+	process.env.PI_CODING_AGENT_DIR = configDir;
+	mock.method(dns, "lookup", async () => {
+		throw new Error("Unexpected DNS lookup in offline test");
+	});
+	syncBuiltinESMExports();
+});
+after(() => {
+	mock.restoreAll();
+	syncBuiltinESMExports();
+	if (priorAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+	else process.env.PI_CODING_AGENT_DIR = priorAgentDir;
+	rmSync(configDir, { recursive: true, force: true });
+});
 
 function createHarness(responses: Response[] = [], curlVersion = "curl 8.4.0 test") {
 	const tools = new Map<string, Tool>();
@@ -40,8 +65,10 @@ function createHarness(responses: Response[] = [], curlVersion = "curl 8.4.0 tes
 	} as unknown as ExtensionAPI;
 	webExtension(pi);
 	const fetch = tools.get("web_fetch");
+	const search = tools.get("web_search");
 	assert(fetch);
-	return { fetch, transferArgs };
+	assert(search);
+	return { fetch, search, transferArgs };
 }
 
 async function expectReject(fetch: Tool, url: string, pattern: RegExp) {
@@ -97,13 +124,50 @@ test("puts curlrc disable first and explicitly disables every proxy source", asy
 	assert(args.includes("--resolve") === false, "literal IP needs no DNS override");
 });
 
-test("pins every validated DNS answer for a public hostname", async () => {
-	const { fetch, transferArgs } = createHarness();
-	await fetch.execute("test", { url: "http://example.com/" });
-	const args = transferArgs[0]!;
-	const resolveIndex = args.indexOf("--resolve");
-	assert.notEqual(resolveIndex, -1);
-	assert.match(args[resolveIndex + 1]!, /^example\.com:80:(?:\[[0-9a-f:]+\]|\d+\.\d+\.\d+\.\d+)(?:,(?:\[[0-9a-f:]+\]|\d+\.\d+\.\d+\.\d+))*$/i);
+test("pins every validated DNS answer for a public hostname", async (t) => {
+	t.mock.method(dns, "lookup", async () => [{ address: "8.8.8.8", family: 4 }, { address: "2606:4700:4700::1111", family: 6 }]);
+	syncBuiltinESMExports();
+	try {
+		const { fetch, transferArgs } = createHarness();
+		await fetch.execute("test", { url: "http://example.com/" });
+		const args = transferArgs[0]!;
+		const resolveIndex = args.indexOf("--resolve");
+		assert.notEqual(resolveIndex, -1);
+		assert.equal(args[resolveIndex + 1], "example.com:80:8.8.8.8,[2606:4700:4700::1111]");
+	} finally {
+		t.mock.restoreAll();
+		syncBuiltinESMExports();
+	}
+});
+
+test("blocks bearer and basic authentication redirects when host or port changes", async () => {
+	writeFileSync(configFile, JSON.stringify({
+		fetchRelay: { endpoint: "https://1.1.1.1/relay", token: "mock-token" },
+		searchProviders: [{ id: "searxng", endpoint: "https://1.1.1.1/", basicAuth: "mock:password" }],
+	}));
+	try {
+		for (const location of ["https://8.8.4.4/blocked", "https://1.1.1.1:8443/blocked"]) {
+			const redirects = [{ status: 302, location: "/same-origin" }, { status: 307, location }];
+			const relay = createHarness([{ code: 7 }, ...redirects]);
+			await expectReject(relay.fetch, "https://8.8.8.8/page", /relay failed: .*cross-origin redirects/);
+			assert.equal(relay.transferArgs.length, 3);
+			const bearerHops = relay.transferArgs.slice(1);
+			for (const args of bearerHops) {
+				assert.equal(args[args.indexOf("-H") + 1], "Authorization: Bearer mock-token");
+				assert.equal(new URL(args[args.indexOf("--url") + 1]!).origin, "https://1.1.1.1");
+			}
+
+			const search = createHarness(redirects);
+			await assert.rejects(search.search.execute("test", { query: "docs" }), /searxng: .*cross-origin redirects/);
+			assert.equal(search.transferArgs.length, 2);
+			for (const args of search.transferArgs) {
+				assert.equal(args[args.indexOf("--user") + 1], "mock:password");
+				assert.equal(new URL(args[args.indexOf("--url") + 1]!).origin, "https://1.1.1.1");
+			}
+		}
+	} finally {
+		rmSync(configFile);
+	}
 });
 
 test("rejects curl older than 8.4 before transfer with an actionable error", async () => {

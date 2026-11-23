@@ -1,3 +1,5 @@
+import type { RequestAuth } from "../transport.ts";
+
 export interface SearchResultItem {
 	url: string;
 	title: string;
@@ -6,7 +8,7 @@ export interface SearchResultItem {
 
 export interface SearchRequest {
 	url: string;
-	extraArgs?: string[];
+	auth?: RequestAuth;
 	/** Self-hosted endpoints may legitimately be plain HTTP; built-in providers stay HTTPS-only. */
 	allowHttp?: boolean;
 }

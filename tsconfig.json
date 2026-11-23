@@ -20,6 +20,7 @@
     "extensions/relay-balance/**/*.ts",
     "extensions/relay-providers/**/*.ts",
     "extensions/subagent/**/*.ts",
+    "extensions/tps-stats/**/*.ts",
     "extensions/web/**/*.ts"
   ]
 }

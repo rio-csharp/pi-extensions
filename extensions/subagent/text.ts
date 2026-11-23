@@ -22,6 +22,10 @@ export function clampTitle(value: string | undefined): string {
 	return characters.length <= TITLE_CAP ? trimmed : characters.slice(0, TITLE_CAP).join("").trimEnd();
 }
 
+export function substitutePrevious(task: string, previousOutput: string): string {
+	return task.replaceAll("{previous}", () => previousOutput);
+}
+
 export function getFinalOutput(messages: Message[]): string {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];

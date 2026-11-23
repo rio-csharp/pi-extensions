@@ -21,13 +21,14 @@ async function loadProvider(id: string): Promise<{ baseUrl: string; apiKey: stri
 	}
 }
 
-async function refresh(ctx: ExtensionContext): Promise<void> {
-	if (!ctx.hasUI) return;
-	const providerId = ctx.model?.provider;
-	if (!providerId) return ctx.ui.setStatus(STATUS_KEY, undefined);
-	const provider = await loadProvider(providerId);
-	if (!provider) return ctx.ui.setStatus(STATUS_KEY, undefined);
+async function refresh(ctx: ExtensionContext, signal: AbortSignal): Promise<void> {
 	try {
+		if (signal.aborted || !ctx.hasUI) return;
+		const providerId = ctx.model?.provider;
+		if (!providerId) return ctx.ui.setStatus(STATUS_KEY, undefined);
+		const provider = await loadProvider(providerId);
+		if (signal.aborted || ctx.model?.provider !== providerId) return;
+		if (!provider) return ctx.ui.setStatus(STATUS_KEY, undefined);
 		const url = new URL(provider.baseUrl);
 		url.pathname = `${url.pathname.replace(/\/$/, "")}/usage`;
 		url.search = "";
@@ -35,37 +36,67 @@ async function refresh(ctx: ExtensionContext): Promise<void> {
 		const res = await fetch(url, {
 			headers: { Authorization: `Bearer ${provider.apiKey}` },
 			redirect: "error",
-			signal: AbortSignal.timeout(8000),
+			signal: AbortSignal.any([signal, AbortSignal.timeout(8000)]),
 		});
-		if (!res.ok) return;
+		if (signal.aborted || !res.ok) return;
 		const j = (await res.json()) as { remaining?: unknown; balance?: unknown; unit?: unknown };
+		if (signal.aborted || ctx.model?.provider !== providerId) return;
 		const amount = Number(j.remaining ?? j.balance);
 		const unit = typeof j.unit === "string" ? j.unit : "USD";
 		const symbol = unit === "USD" ? "$" : unit === "CNY" ? "¥" : `${unit} `;
-		// The model may have switched while the request was in flight.
-		if (Number.isFinite(amount) && ctx.model?.provider === providerId) {
+		if (Number.isFinite(amount)) {
 			ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("muted", `${symbol}${amount.toFixed(2)}`));
 		}
 	} catch {
+		// Failed probes and contexts retired by Pi should leave the footer alone.
 	}
+}
+
+interface BalanceSession {
+	ctx: ExtensionContext;
+	manager: ExtensionContext["sessionManager"];
+	request?: AbortController;
 }
 
 export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setInterval> | undefined;
+	let active: BalanceSession | undefined;
+
+	function stop(): void {
+		active?.request?.abort();
+		active = undefined;
+		clearInterval(timer);
+		timer = undefined;
+	}
+
+	function update(session: BalanceSession): void {
+		if (active !== session) return;
+		session.request?.abort();
+		session.request = new AbortController();
+		void refresh(session.ctx, session.request.signal);
+	}
 
 	pi.on("session_start", (_event, ctx) => {
-		if (timer) clearInterval(timer);
-		timer = undefined;
+		stop();
+		const session = { ctx, manager: ctx.sessionManager };
+		active = session;
 		if (ctx.mode !== "tui") return;
-		void refresh(ctx);
-		timer = setInterval(() => void refresh(ctx), 5 * 60_000);
+		update(session);
+		timer = setInterval(() => update(session), 5 * 60_000);
 	});
 
-	pi.on("model_select", (_event, ctx) => void refresh(ctx));
+	pi.on("model_select", (event, ctx) => {
+		if (!active || active.manager !== ctx.sessionManager) return;
+		active.ctx = ctx;
+		if (ctx.hasUI && event.previousModel?.provider !== event.model.provider) {
+			ctx.ui.setStatus(STATUS_KEY, undefined);
+		}
+		update(active);
+	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		if (timer) clearInterval(timer);
-		timer = undefined;
+		if (!active || active.manager !== ctx.sessionManager) return;
+		stop();
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 	});
 }

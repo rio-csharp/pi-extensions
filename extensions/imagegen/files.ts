@@ -48,8 +48,8 @@ export async function saveImage(
 ): Promise<SavedImage> {
 	const buffer = Buffer.from(base64, "base64");
 	const bytes = buffer.byteLength;
-	await mkdir(dir, { recursive: true });
 	const extension = extensionFor(mimeType);
+	await mkdir(dir, { recursive: true });
 	const stem = `${timestamp()}-${safeSegment(alias)}-${Math.random().toString(36).slice(2, 8)}`;
 	const path = join(dir, `${stem}.${extension}`);
 	return withFileMutationQueue(path, async () => {

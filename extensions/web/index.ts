@@ -119,7 +119,7 @@ export default function (pi: ExtensionAPI) {
 					const relayUrl = new URL(relay.endpoint);
 					relayUrl.searchParams.set("url", parseWebUrl(requestedUrl).toString());
 					const relayed = await fetchPublic(pi, relayUrl, "=https", MAX_TRANSFER_BYTES, signal, {
-						extraArgs: ["-H", `Authorization: Bearer ${relay.token}`],
+						auth: { kind: "bearer", token: relay.token },
 					});
 					fetched = { body: relayed.body, url: parseWebUrl(requestedUrl) };
 					via = "relay";

@@ -46,6 +46,15 @@ test("semaphore rejects waiters whose signal aborts while queued", async () => {
 	release();
 });
 
+test("semaphore skips work canceled between grant and callback and releases the slot", async () => {
+	const semaphore = new Semaphore(() => 1);
+	const controller = new AbortController();
+	const attempt = semaphore.with(controller.signal, async () => assert.fail("canceled callback ran"));
+	controller.abort();
+	await assert.rejects(attempt, /canceled while queued/);
+	assert.equal(await semaphore.with(new AbortController().signal, async () => "next"), "next");
+});
+
 test("semaphore honors a lowered limit until enough slots are released", async () => {
 	let limit = 3;
 	const semaphore = new Semaphore(() => limit);

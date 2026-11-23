@@ -24,7 +24,7 @@ const TitleString = Type.String({
 
 const ModelOverride = Type.Optional(
 	Type.String({
-		description: "Target model for the child as provider/id or bare id, with an optional :thinkingLevel suffix (e.g. qfg/claude-opus-5.5:high). Defaults to the parent model.",
+		description: "Optional target model as provider/id or bare id, with an optional :thinkingLevel suffix. Prefer omitting this field to use the configured subagent default, or the parent model if no default is configured. A blank value uses the default.",
 	}),
 );
 
@@ -88,7 +88,7 @@ export const SubagentParams = Type.Object({
 
 export const SubagentJobsParams = Type.Object({
 	action: stringEnum(["list", "status", "steer", "resume", "cancel"] as const, {
-		description: "Supervisor action",
+		description: "Supervisor action. Use model, thinking, and tools only with resume. For other actions, omit all three fields.",
 	}),
 	jobId: Type.Optional(Type.String({ description: "Background job id; required except for list" })),
 	taskIndex: Type.Optional(
@@ -99,17 +99,17 @@ export const SubagentJobsParams = Type.Object({
 	),
 	model: Type.Optional(
 		Type.String({
-			description: "Resume only: model for every task of the job as provider/id or bare id, with an optional :thinkingLevel suffix. Replaces the recorded model; the child keeps its session history.",
+			description: "Resume only. Omit on other actions and to keep the recorded model. Supply a provider/id or bare id with an optional :thinkingLevel suffix to replace it. A blank value keeps the recorded model.",
 		}),
 	),
 	thinking: Type.Optional(
 		stringEnum(THINKING_LEVELS, {
-			description: "Resume only: thinking level for every task of the job. Defaults to the level already recorded on the job.",
+			description: "Resume only. Omit on other actions and to keep the recorded thinking level.",
 		}),
 	),
 	tools: Type.Optional(
 		Type.Array(Type.String(), {
-			description: "Resume only: tool selection for every task of the job (plain names, or only +name/-name entries). Defaults to the selection already recorded on the job.",
+			description: "Resume only. Omit on other actions and to keep the recorded tool selection. Plain names replace the selection. Entries that are all +name/-name adjust the defaults.",
 		}),
 	),
 	includeOutput: Type.Optional(

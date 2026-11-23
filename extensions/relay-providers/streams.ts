@@ -3,6 +3,7 @@ import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import {
 	createAssistantMessageEventStream,
 	type AssistantMessage,
+	type AssistantMessageEvent,
 	type AssistantMessageEventStream,
 	type Model,
 	type SimpleStreamOptions,
@@ -140,6 +141,29 @@ export function createRetryStatusTracker(getSessionContext: () => ExtensionConte
 	};
 }
 
+function isStreamPreamble(event: Exclude<AssistantMessageEvent, { type: "error" }>): boolean {
+	switch (event.type) {
+		case "start":
+		case "text_start":
+		case "thinking_start":
+			return true;
+		case "toolcall_start": {
+			const block = event.partial.content[event.contentIndex];
+			return block?.type !== "toolCall" || (!block.name && Object.keys(block.arguments).length === 0);
+		}
+		case "text_delta":
+		case "thinking_delta":
+		case "toolcall_delta":
+			return event.delta === "";
+		case "text_end":
+		case "thinking_end":
+			return event.content === "";
+		case "toolcall_end":
+		case "done":
+			return false;
+	}
+}
+
 export function createQuotaRetryStream(
 	providerLabel: string,
 	retry: QuotaRetryOptions,
@@ -152,6 +176,11 @@ export function createQuotaRetryStream(
 	return (model, context, options) => {
 		const output = createAssistantMessageEventStream();
 		const status = statusTracker.createHandle();
+		const pendingEvents: AssistantMessageEvent[] = [];
+		const flushPendingEvents = () => {
+			for (const event of pendingEvents) output.push(event);
+			pendingEvents.length = 0;
+		};
 		let lastError: AssistantMessage | undefined;
 		const aliasId = resolveModelId?.(readThinkingLevel(options));
 		const requestOptions =
@@ -179,14 +208,22 @@ export function createQuotaRetryStream(
 						continue;
 					}
 
-					// Never retry once output has started: a later retry could duplicate billed output.
-					emitted = true;
-					status.clear();
+					// Structural events can precede a retryable error. Keep their order if this attempt is forwarded.
+					if (!emitted) {
+						if (isStreamPreamble(event)) {
+							pendingEvents.push(event);
+							continue;
+						}
+						emitted = true;
+						status.clear();
+						flushPendingEvents();
+					}
 					output.push(event);
 				}
 
 				if (!requestError) {
 					status.clear();
+					flushPendingEvents();
 					output.end();
 					return;
 				}
@@ -202,6 +239,7 @@ export function createQuotaRetryStream(
 
 				if (!shouldRetry) {
 					status.clear();
+					flushPendingEvents();
 					const aborted = options?.signal?.aborted || rawRequestError.stopReason === "aborted";
 					output.push({
 						type: "error",
@@ -212,6 +250,7 @@ export function createQuotaRetryStream(
 					return;
 				}
 
+				pendingEvents.length = 0;
 				attempt += 1;
 				const delayMs =
 					retry.backoff === "fixed"
@@ -229,6 +268,7 @@ export function createQuotaRetryStream(
 			}
 		})().catch(() => {
 			status.clear();
+			flushPendingEvents();
 			const message = makeAbortedMessage(model, lastError);
 			message.stopReason = options?.signal?.aborted ? "aborted" : "error";
 			message.errorMessage = options?.signal?.aborted

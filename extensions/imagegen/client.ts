@@ -82,7 +82,9 @@ export function validateSize(size: string): string | undefined {
 
 /** Identify the real image format from its magic bytes; the API may ignore output_format. */
 export function sniffMimeType(bytes: Uint8Array): string {
-	if (bytes.length >= 8 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) return "image/png";
+	if ([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a].every((byte, index) => bytes[index] === byte)) {
+		return "image/png";
+	}
 	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
 	if (
 		bytes.length >= 12 &&
@@ -97,15 +99,19 @@ export function sniffMimeType(bytes: Uint8Array): string {
 	) {
 		return "image/webp";
 	}
-	if (bytes.length >= 3 && bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46) return "image/gif";
+	if (
+		bytes[0] === 0x47 && bytes[1] === 0x49 && bytes[2] === 0x46 && bytes[3] === 0x38 &&
+		(bytes[4] === 0x37 || bytes[4] === 0x39) && bytes[5] === 0x61
+	) return "image/gif";
 	return "application/octet-stream";
 }
 
 export function extensionFor(mimeType: string): string {
+	if (mimeType === "image/png") return "png";
 	if (mimeType === "image/jpeg") return "jpg";
 	if (mimeType === "image/webp") return "webp";
 	if (mimeType === "image/gif") return "gif";
-	return "png";
+	throw new ImageRequestError("unsupported image format");
 }
 
 function readWebpDimensions(view: DataView): { width: number; height: number } | undefined {
@@ -133,7 +139,7 @@ function readWebpDimensions(view: DataView): { width: number; height: number } |
 /** Pixel dimensions from a PNG, JPEG, or WebP header, when they can be read. */
 export function readDimensions(bytes: Uint8Array): { width: number; height: number } | undefined {
 	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-	if (bytes.length >= 24 && bytes[1] === 0x50 && bytes[2] === 0x4e && bytes[3] === 0x47) {
+	if (bytes.length >= 24 && sniffMimeType(bytes) === "image/png") {
 		return { width: view.getUint32(16), height: view.getUint32(20) };
 	}
 	if (bytes.length >= 4 && bytes[0] === 0xff && bytes[1] === 0xd8) {
@@ -237,7 +243,11 @@ function parsePayload(payload: unknown): ParsedResponse {
 		if (typeof base64 === "string" && base64 !== "") {
 			const bytes = Buffer.from(base64, "base64");
 			if (bytes.length === 0) throw new ImageRequestError("response contains empty image data");
-			images.push({ data: base64, mimeType: sniffMimeType(bytes) });
+			const mimeType = sniffMimeType(bytes);
+			if (mimeType === "application/octet-stream") {
+				throw new ImageRequestError("response contains unsupported image data; expected PNG, JPEG, WebP, or GIF");
+			}
+			images.push({ data: base64, mimeType });
 			continue;
 		}
 		if (typeof url === "string" && url !== "") {
@@ -288,7 +298,20 @@ export async function requestImage(request: ImageRequest): Promise<ImageResponse
 	const fetchImpl = request.fetchImpl ?? fetch;
 	const retryBaseDelay = request.retryBaseDelayMs ?? BASE_DELAY_MS;
 	const editing = (request.images?.length ?? 0) > 0;
-	const endpoint = `${request.baseUrl.replace(/\/+$/, "")}/${editing ? "images/edits" : "images/generations"}`;
+	let endpoint: URL;
+	try {
+		endpoint = new URL(request.baseUrl);
+	} catch {
+		throw new ImageRequestError("invalid image API base URL");
+	}
+	if (endpoint.protocol !== "https:" && endpoint.protocol !== "http:") {
+		throw new ImageRequestError("image API base URL must be HTTP(S)");
+	}
+	if (endpoint.username || endpoint.password) {
+		throw new ImageRequestError("image API base URL must not embed credentials");
+	}
+	endpoint.pathname = `${endpoint.pathname.replace(/\/+$/, "")}/images/${editing ? "edits" : "generations"}`;
+	endpoint.hash = ""; // Preserve configured query parameters. Fragments are client-side only.
 	let lastError: ImageRequestError | undefined;
 
 	for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt += 1) {

@@ -43,6 +43,8 @@ export class Semaphore {
 	async with<T>(signal: AbortSignal, run: () => Promise<T>): Promise<T> {
 		const release = await this.acquire(signal);
 		try {
+			// A cancellation can arrive after a slot is granted but before this continuation runs.
+			if (signal.aborted) throw new Error(QUEUE_CANCEL_MESSAGE);
 			return await run();
 		} finally {
 			release();

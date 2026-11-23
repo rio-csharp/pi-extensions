@@ -2,7 +2,7 @@ import { type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-cod
 import { sliceByColumn, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
-const INLINE_STATUS_KEYS = new Set(["relay-balance", "kimi-usage", "opendesign-usage"]);
+const INLINE_STATUS_KEYS = new Set(["relay-balance", "kimi-usage", "opendesign-usage", "tps"]);
 const DEDICATED_ROW_PREFIX = "footer-row-";
 const MAX_LABEL_LENGTH = 48;
 const MARQUEE_TICK_MS = 500;

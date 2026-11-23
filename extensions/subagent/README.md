@@ -16,10 +16,14 @@ While work runs, each subagent publishes a live `footer-row-` status line: the t
 `~/.pi/agent/subagent.json` — read on every job start, so edits apply without a reload:
 
 ```json
-{ "concurrency": 4 }
+{ "concurrency": 4, "defaultModel": "provider/model-id" }
 ```
 
-`concurrency` caps how many child pi processes run at once (default 4, range 1–32); extra tasks queue.
+`concurrency` caps how many child pi processes run at once (default 4, range 1–32). Extra tasks queue.
+
+Replace `provider/model-id` with an available model from your Pi catalog. `defaultModel` also accepts a bare model ID and an optional `:thinkingLevel` suffix. New jobs choose the item override, the call-level override, the configured default, then the parent model, in that order. A configured model that is missing from the catalog or lacks configured authentication blocks calls that need the default. Changing the default affects new jobs. Resuming without overrides keeps the model already recorded for the job.
+
+When `subagent` is active, Pi shows the model the available model references and recommends omitting `model` for routine delegation. A minimal call is `{"title":"Review module","task":"Review src/ for regressions."}`. For `subagent_jobs`, only `resume` accepts `model`, `thinking`, and `tools`.
 
 ## Per-call overrides
 
@@ -27,12 +31,14 @@ Every mode accepts four optional overrides, so one call can steer each child ind
 
 | Field | Effect |
 | --- | --- |
-| `model` | Target model as `provider/id` or bare `id`, with an optional `:thinkingLevel` suffix (`qfg/claude-opus-5.5:high`, `deepseek-v4.1-flash`, `amr-link/deepseek-v4.1-flash:low`). Defaults to the parent model. |
+| `model` | Target model as `provider/id` or bare `id`, with an optional `:thinkingLevel` suffix (`qfg/claude-opus-5.5:high`, `deepseek-v4.1-flash`, `amr-link/deepseek-v4.1-flash:low`). Defaults to `defaultModel` or the parent model. |
 | `thinking` | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Works with the inherited parent model too; wins over a `:suffix` on `model`. Defaults to `medium`. |
 | `tools` | Passed to the child as `--tools`. Omit it to inherit the child's complete default tool set, and pass it only to deliberately restrict permissions (for example a read-only reviewer with `["read", "grep"]`). Plain names replace the selection; entries that are all `+name`/`-name` adjust the defaults, and pi rejects mixed forms. |
 | `systemPrompt` | Extra instructions appended to the child's system prompt. |
 
-Overrides are validated and **fail loudly**: an explicit override that cannot be honored aborts the call instead of quietly running something else. That covers an unknown model id (the error lists candidate `provider/id` entries), a provider without configured credentials, an empty model string, an unknown thinking level, malformed `tools` entries, an unknown tool name, mixing plain names with `+name`/`-name`, and a wildcard inside a `+name`/`-name` entry. Wildcards stay legal for plain allowlist names. Each error names the offending value and the way out — usually `omit "model" to inherit <parent model>`, `omit "tools" to inherit the child's default tools`, or `omit "thinking" to use medium`. A background start that fails validation registers no job.
+A blank optional model, thinking level, working directory, system prompt, or tool selection is treated as omitted. The supervisor ignores arguments its current action does not use.
+
+Overrides that supply a value are validated. An explicit override that cannot be honored aborts the call. That covers an unknown model id (the error lists candidate `provider/id` entries), a provider without configured credentials, an unknown thinking level, malformed `tools` entries, an unknown tool name, mixing plain names with `+name`/`-name`, and a wildcard inside a `+name`/`-name` entry. Wildcards stay legal for plain allowlist names. A background start that fails validation registers no job.
 
 Thinking, tools, and system prompt are recorded with the job definition, so a background job and its resume replay the same overrides.
 
@@ -44,7 +50,7 @@ Because the history is kept, a smaller target model may not fit it: if a task re
 
 ## Notes
 
-- Every child runs with pi defaults (current model, default tools) unless the call overrides model, thinking, tools, or system prompt; no agent files are needed
+- Children use Pi's default tools unless the call overrides them
 - Jobs survive interruption: interrupted background jobs can be resumed from their persisted child sessions
 - Children receive only the environment variables their selected provider needs
 - A child never waits on UI prompts (they are auto-cancelled) and nested subagents stop at depth 5

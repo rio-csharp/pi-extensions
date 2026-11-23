@@ -37,10 +37,10 @@ test("searxng builds a json search URL with optional basic auth", () => {
 	const anon = createSearxngProvider({ id: "searxng", endpoint: "https://searx.example.com/" });
 	const request = anon.buildRequest("hello world", 5);
 	assert.equal(request.url, "https://searx.example.com/search?q=hello+world&format=json");
-	assert.equal(request.extraArgs, undefined);
+	assert.equal(request.auth, undefined);
 
 	const authed = createSearxngProvider({ id: "searxng", endpoint: "https://searx.example.com", basicAuth: "u:p" });
-	assert.deepEqual(authed.buildRequest("q", 5).extraArgs, ["--user", "u:p"]);
+	assert.deepEqual(authed.buildRequest("q", 5).auth, { kind: "basic", credentials: "u:p" });
 });
 
 test("searxng parses results and drops invalid entries", () => {

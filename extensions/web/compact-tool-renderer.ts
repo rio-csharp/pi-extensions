@@ -1,4 +1,4 @@
-import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { AgentToolResult, Theme, ToolRenderResultOptions } from "@earendil-works/pi-coding-agent";
 import { Text, visibleWidth, type Component } from "@earendil-works/pi-tui";
 
 interface ToolRenderContext<TState, TArgs> {
@@ -29,8 +29,8 @@ export interface CompactRenderState {
 
 export interface CompactRendererOptions {
 	observeResult?: (
-		result: any,
-		options: { isPartial: boolean },
+		result: AgentToolResult<unknown>,
+		options: ToolRenderResultOptions,
 		state: CompactRenderState,
 	) => void;
 }
@@ -43,8 +43,8 @@ export interface CompactRenderer {
 		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
 	) => Component;
 	renderResult: (
-		result: any,
-		options: { isPartial: boolean },
+		result: AgentToolResult<unknown>,
+		options: ToolRenderResultOptions,
 		theme: Theme,
 		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
 	) => Component;
@@ -170,7 +170,17 @@ export function createCompactRenderer(
 		renderResult(result, renderOptions, theme, context) {
 			options.observeResult?.(result, renderOptions, context.state);
 			updateCallText(context.args, theme, context);
-			return context.lastComponent ?? new EmptyComponent();
+			if (!renderOptions.expanded) {
+				return context.lastComponent instanceof EmptyComponent ? context.lastComponent : new EmptyComponent();
+			}
+			const color = context.isError ? "error" : "toolOutput";
+			const output = result.content
+				.filter((block) => block.type === "text")
+				.map((block) => block.text)
+				.join("\n");
+			const text = context.lastComponent instanceof Text ? context.lastComponent : new Text("", 0, 0);
+			text.setText(output.split("\n").map((line) => theme.fg(color, line)).join("\n"));
+			return text;
 		},
 
 		dispose() {

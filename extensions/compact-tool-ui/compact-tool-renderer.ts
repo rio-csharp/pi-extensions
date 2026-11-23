@@ -31,12 +31,13 @@ export interface CompactRenderState {
 	finishedAt?: number;
 	outputLines?: number;
 	callComponent?: CompactInvocationComponent;
-	expanded?: ExpandedSlot;
+	expanded?: ExpandedRenderState;
 }
 
-interface ExpandedSlot {
-	state: Record<string, any>;
-	lastComponent?: Component;
+interface ExpandedRenderState {
+	state: CompactRenderState;
+	call?: Component;
+	result?: Component;
 }
 
 export interface ExpandedRenderers {
@@ -257,18 +258,19 @@ export function createCompactRenderer(
 		return component;
 	};
 
-	// Built-in renderers reuse `context.lastComponent` and call `setText`, so the expanded view needs its own slot.
+	// Match Pi's render context: shared delegate state and a separate previous component per slot.
 	const renderExpanded = (
 		context: ToolRenderContext<CompactRenderState, Record<string, any>>,
+		slot: "call" | "result",
 		render: (context: ToolRenderContext<CompactRenderState, Record<string, any>>) => Component,
 	): Component => {
-		const slot = (context.state.expanded ??= { state: {} });
+		const expanded = (context.state.expanded ??= { state: {} });
 		const component = render({
 			...context,
-			state: slot.state as CompactRenderState,
-			lastComponent: slot.lastComponent,
+			state: expanded.state,
+			lastComponent: expanded[slot],
 		});
-		slot.lastComponent = component;
+		expanded[slot] = component;
 		return component;
 	};
 
@@ -297,7 +299,9 @@ export function createCompactRenderer(
 		renderCall(args, theme, context) {
 			const delegate = context.expanded ? options.expanded?.() : undefined;
 			if (delegate?.renderCall) {
-				const content = renderExpanded(context, (expandedContext) => delegate.renderCall!(args, theme, expandedContext));
+				const content = renderExpanded(context, "call", (expandedContext) =>
+					delegate.renderCall!(args, theme, expandedContext),
+				);
 				return composeExpanded(context, theme, args, content);
 			}
 			return updateCallText(args, theme, context, hasExpandedView());
@@ -308,14 +312,13 @@ export function createCompactRenderer(
 			if (delegate?.renderResult) {
 				// The header belongs to the call slot, which pi renders above this one; adding it here
 				// would print it twice.
-				return renderExpanded(context, (expandedContext) =>
+				return renderExpanded(context, "result", (expandedContext) =>
 					delegate.renderResult!(result, renderOptions, theme, expandedContext),
 				);
 			}
 			options.observeResult?.(result, renderOptions, context.state);
 			updateCallText(context.args, theme, context, hasExpandedView());
-			// Never reuse `lastComponent`: after a collapse it is still the expanded container, which
-			// would leave the full built-in view on screen.
+			// Return an empty result slot when collapsed, regardless of the previous expanded result.
 			return new EmptyComponent();
 		},
 

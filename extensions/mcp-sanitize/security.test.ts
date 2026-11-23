@@ -102,6 +102,21 @@ test("handler sanitizes structuredContent deeply and keeps it", () => {
 	});
 });
 
+test("structuredContent preserves special own JSON keys as data properties", () => {
+	const handler = createHarness();
+	const input = JSON.parse('{"__proto__":{"label":"a\\u200bb"},"constructor":"c\\u200bd","nested":[{"__proto__":"e\\u200bf","prototype":"g\\u200bh"}]}');
+	const expected = JSON.parse('{"__proto__":{"label":"ab"},"constructor":"cd","nested":[{"__proto__":"ef","prototype":"gh"}]}');
+	const { structuredContent } = handler(mcpEvent({ structuredContent: input }));
+
+	assert.deepEqual(structuredContent, expected);
+	for (const copy of [structuredContent, structuredContent.nested[0]]) {
+		assert.equal(Object.getPrototypeOf(copy), Object.prototype);
+		assert.ok(Object.hasOwn(copy, "__proto__"));
+	}
+	assert.equal(structuredContent.label, undefined);
+	assert.equal(input.__proto__.label, `a${ZWSP}b`);
+});
+
 test("handler sanitizes error results too", () => {
 	const handler = createHarness();
 	const result = handler(

@@ -31,7 +31,7 @@ D:\project\generated\20261118-142033-flare-9f3ac1.png · 1254x1254 · 1812KB
 
 Credentials come from an existing `relay-providers.json` entry when `provider` names one; `baseUrl` and `apiKey` set here override it. Without either, `$IMAGEGEN_BASE_URL` and `$IMAGEGEN_API_KEY` are used. `apiKey` accepts a `$ENV_VAR` reference, so no secret has to be stored in the file.
 
-`baseUrl` must include the API version segment, for example `https://api.ai-pixel.online/v1`.
+`baseUrl` must include the API version segment, for example `https://api.ai-pixel.online/v1`. The extension appends the image route to the URL path, preserves query parameters, and discards the fragment.
 
 ### Models
 

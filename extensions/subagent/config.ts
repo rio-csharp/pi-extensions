@@ -9,6 +9,7 @@ const CONFIG_FILE = "subagent.json";
 
 export interface SubagentConfig {
 	concurrency: number;
+	defaultModel?: string;
 	warning?: string;
 }
 
@@ -28,14 +29,23 @@ export function loadSubagentConfig(dir: string = getAgentDir()): SubagentConfig 
 		return { concurrency: DEFAULT_CONCURRENCY, warning: `${CONFIG_FILE} is not valid JSON; using default concurrency ${DEFAULT_CONCURRENCY}.` };
 	}
 
-	const value = (parsed as { concurrency?: unknown } | null)?.concurrency;
-	if (value === undefined) return { concurrency: DEFAULT_CONCURRENCY };
-	if (typeof value !== "number" || !Number.isFinite(value)) {
-		return { concurrency: DEFAULT_CONCURRENCY, warning: `${CONFIG_FILE}: concurrency must be a number; using default ${DEFAULT_CONCURRENCY}.` };
+	const values = parsed as { concurrency?: unknown; defaultModel?: unknown } | null;
+	const config: SubagentConfig = { concurrency: DEFAULT_CONCURRENCY };
+	const warnings: string[] = [];
+	const value = values?.concurrency;
+	if (typeof value === "number" && Number.isFinite(value)) {
+		config.concurrency = Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, Math.floor(value)));
+		if (config.concurrency !== value) warnings.push(`concurrency ${value} clamped to ${config.concurrency}.`);
+	} else if (value !== undefined) {
+		warnings.push(`concurrency must be a number; using default ${DEFAULT_CONCURRENCY}.`);
 	}
-	const clamped = Math.max(MIN_CONCURRENCY, Math.min(MAX_CONCURRENCY, Math.floor(value)));
-	if (clamped !== value) {
-		return { concurrency: clamped, warning: `${CONFIG_FILE}: concurrency ${value} clamped to ${clamped}.` };
+
+	const defaultModel = values?.defaultModel;
+	if (typeof defaultModel === "string" && defaultModel.trim()) {
+		config.defaultModel = defaultModel.trim();
+	} else if (defaultModel !== undefined) {
+		warnings.push("defaultModel must be a non-empty model reference; using the parent model.");
 	}
-	return { concurrency: clamped };
+	if (warnings.length > 0) config.warning = `${CONFIG_FILE}: ${warnings.join(" ")}`;
+	return config;
 }

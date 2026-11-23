@@ -114,6 +114,17 @@ function resolveModel(reference: string, ctx: InvocationContext): ModelRef {
 	return { provider: configured.provider, id: configured.id };
 }
 
+export function resolveConfiguredDefault(ctx: InvocationContext, reference: string): string {
+	try {
+		const parsed = parseModelOverride(reference);
+		const resolved = resolveModel(parsed.model, ctx);
+		const canonical = `${resolved.provider}/${resolved.id}`;
+		return parsed.thinking ? `${canonical}:${parsed.thinking}` : canonical;
+	} catch (error) {
+		throw new Error(`subagent.json defaultModel ${JSON.stringify(reference)} is unavailable. Update or remove defaultModel, or pass a valid model explicitly.`, { cause: error });
+	}
+}
+
 function readThinking(value: string | undefined): ChildThinkingLevel | undefined {
 	const normalized = value?.trim().toLowerCase();
 	if (!normalized) return undefined;

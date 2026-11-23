@@ -155,7 +155,8 @@ function normalizeBaseUrl(value: string, warnings: string[]): string {
 		warnings.push(`${IMAGEGEN_CONFIG_FILE}: base URL must not embed credentials.`);
 		return "";
 	}
-	return url.toString().replace(/\/+$/, "");
+	url.pathname = url.pathname.replace(/\/+$/, "");
+	return url.toString();
 }
 
 /** Billed cost for `count` images at `pricePerImage`, rounded to cents' worth of precision. */

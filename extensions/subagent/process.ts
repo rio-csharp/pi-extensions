@@ -32,9 +32,10 @@ export function isDepthLimitReached(): boolean {
 
 function getPiInvocation(args: string[]): { command: string; args: string[] } {
 	const currentScript = process.argv[1];
-	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
+	const isBunVirtualScript = currentScript !== undefined &&
+		(currentScript.startsWith("/$bunfs/root/") || /^[A-Za-z]:[\\/]~BUN[\\/]root[\\/]/.test(currentScript));
 	if (currentScript && !isBunVirtualScript && fs.existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+		return { command: process.execPath, args: [path.resolve(currentScript), ...args] };
 	}
 
 	const execName = path.basename(process.execPath).toLowerCase();
@@ -56,15 +57,6 @@ export function providerEnvNames(provider: string | undefined, ctx: Pick<Extensi
 }
 
 const PROMPT_FILE_LABEL = "subagent";
-
-async function writePromptToTempFile(prompt: string): Promise<{ dir: string; filePath: string }> {
-	const tmpDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
-	const filePath = path.join(tmpDir, `prompt-${PROMPT_FILE_LABEL}.md`);
-	await withFileMutationQueue(filePath, async () => {
-		await fs.promises.writeFile(filePath, prompt, { encoding: "utf-8", mode: 0o600 });
-	});
-	return { dir: tmpDir, filePath };
-}
 
 const liveChildren = new Set<ChildProcess>();
 let sweepRegistered = false;
@@ -154,21 +146,35 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 		});
 	};
 
-	try {
-		if (options.systemPrompt?.trim()) {
-			const tmp = await writePromptToTempFile(options.systemPrompt.trim());
-			tmpPromptDir = tmp.dir;
-			tmpPromptPath = tmp.filePath;
-			args.push("--append-system-prompt", tmpPromptPath);
-		}
+	const signal = options.signal;
+	let wasAborted = false;
+	const setError = (message: string) => {
+		result.stopReason = "error";
+		result.errorMessage = sanitizeBounded(message, RESULT_DIAGNOSTIC_CAP, "Error truncated");
+	};
 
-		let wasAborted = false;
-		const signal = options.signal;
+	try {
+		signal?.throwIfAborted();
+		const cwd = path.resolve(options.defaultCwd, options.cwd ?? ".");
+		try {
+			if (!(await fs.promises.stat(cwd)).isDirectory()) throw new Error("path is not a directory");
+		} catch (error) {
+			throw new Error(`Invalid subagent working directory ${JSON.stringify(cwd)}: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		const systemPrompt = options.systemPrompt?.trim();
+		if (systemPrompt) {
+			tmpPromptDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "pi-subagent-"));
+			const filePath = path.join(tmpPromptDir, `prompt-${PROMPT_FILE_LABEL}.md`);
+			tmpPromptPath = filePath;
+			await withFileMutationQueue(filePath, () => fs.promises.writeFile(filePath, systemPrompt, { encoding: "utf-8", mode: 0o600 }));
+			args.push("--append-system-prompt", filePath);
+		}
+		signal?.throwIfAborted();
 
 		const exitCode = await new Promise<number>((resolve) => {
 			const invocation = getPiInvocation(args);
 			const proc = spawn(invocation.command, invocation.args, {
-				cwd: options.cwd ?? options.defaultCwd,
+				cwd,
 				shell: false,
 				stdio: ["pipe", "pipe", "pipe"],
 				env: {
@@ -183,10 +189,13 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 			let buffer = "";
 			let processClosed = false;
 			let agentSettled = false;
+			let promptAccepted = false;
+			let promptHandled = false;
 			let forceKillTimer: ReturnType<typeof setTimeout> | undefined;
 			let abortListener: (() => void) | undefined;
 			let requestId = 0;
 			const pendingRequests = new Map<string, {
+				type: "prompt" | "steer";
 				resolve: () => void;
 				reject: (error: Error) => void;
 				timer: ReturnType<typeof setTimeout>;
@@ -215,7 +224,7 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 						rejectRequest(new Error(`Timed out waiting for subagent RPC ${type} response`));
 					}, RPC_RESPONSE_TIMEOUT_MS);
 					timer.unref?.();
-					pendingRequests.set(id, { resolve: resolveRequest, reject: rejectRequest, timer });
+					pendingRequests.set(id, { type, resolve: resolveRequest, reject: rejectRequest, timer });
 					try {
 						writeRpcLine({ id, type, message });
 					} catch (error) {
@@ -228,6 +237,7 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 
 			const retireControl = () => options.onControlChange?.(undefined);
 			const requestGracefulClose = () => {
+				if (processClosed) return;
 				if (proc.stdin.writable && !proc.stdin.destroyed) proc.stdin.end();
 				if (!forceKillTimer) {
 					forceKillTimer = setTimeout(() => {
@@ -247,13 +257,22 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 					return;
 				}
 
+				if (!event || typeof event !== "object") return;
 				if (event.type === "response" && typeof event.id === "string") {
 					const pending = pendingRequests.get(event.id);
 					if (pending) {
 						clearTimeout(pending.timer);
 						pendingRequests.delete(event.id);
-						if (event.success) pending.resolve();
-						else pending.reject(new Error(typeof event.error === "string" ? event.error : `Subagent RPC ${event.command ?? "command"} failed`));
+						if (event.success) {
+							if (pending.type === "prompt") {
+								promptAccepted = true;
+								promptHandled = event.data?.disposition === "handled";
+								if (promptHandled) requestGracefulClose();
+							}
+							pending.resolve();
+						} else {
+							pending.reject(new Error(typeof event.error === "string" ? event.error : `Subagent RPC ${pending.type} failed`));
+						}
 					}
 					return;
 				}
@@ -334,16 +353,12 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 				buffer += stdoutDecoder.end();
 				if (buffer.trim()) processLine(buffer);
 				rejectPendingRequests(new Error(`Subagent RPC process closed (code=${code}, signal=${signalName ?? "none"})`));
-				if (code === null && !agentSettled) {
-					result.stderr = appendBounded(
-						result.stderr,
-						`${result.stderr ? "\n" : ""}Subagent process terminated by ${signalName ?? "an unknown signal"}`,
-						RESULT_DIAGNOSTIC_CAP,
-					);
-					resolve(1);
-					return;
+				const startupDiagnostic = !promptAccepted && code !== 0 && result.stderr.trim();
+				if (startupDiagnostic) setError(startupDiagnostic);
+				else if (!agentSettled && !promptHandled && !result.errorMessage) {
+					setError(result.stderr.trim() || `Subagent RPC process closed before the task settled (code=${code}, signal=${signalName ?? "none"})`);
 				}
-				resolve(code ?? 0);
+				resolve(code ?? (agentSettled ? 0 : 1));
 			});
 
 			proc.on("error", (error) => {
@@ -371,7 +386,7 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 			if (!wasAborted) {
 				void sendRpcCommand("prompt", `Task: ${task}`)
 					.then(() => {
-						if (processClosed || agentSettled) return;
+						if (processClosed || agentSettled || promptHandled || wasAborted) return;
 						options.onControlChange?.({
 							steer: async (instruction) => {
 								if (processClosed || agentSettled) throw new Error("Subagent is no longer running");
@@ -380,12 +395,8 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 						});
 					})
 					.catch((error) => {
-						result.stopReason = "error";
-						result.errorMessage = sanitizeBounded(
-							error instanceof Error ? error.message : String(error),
-							RESULT_DIAGNOSTIC_CAP,
-							"RPC error truncated",
-						);
+						if (processClosed || wasAborted) return;
+						setError(error instanceof Error ? error.message : String(error));
 						requestGracefulClose();
 					});
 			}
@@ -395,6 +406,15 @@ export async function runChild(options: RunChildOptions): Promise<SingleResult> 
 		if (wasAborted) {
 			result.stopReason = "aborted";
 			result.errorMessage = "Subagent was aborted";
+		}
+		return result;
+	} catch (error) {
+		result.exitCode = 1;
+		if (signal?.aborted) {
+			result.stopReason = "aborted";
+			result.errorMessage = "Subagent was aborted before starting";
+		} else {
+			setError(`Could not start subagent: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		return result;
 	} finally {

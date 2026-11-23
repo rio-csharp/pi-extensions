@@ -23,9 +23,11 @@ export class BlockedHostError extends Error {
 	}
 }
 
+export type RequestAuth = { kind: "bearer"; token: string } | { kind: "basic"; credentials: string };
+
 export interface RequestOptions {
 	timeoutMs?: number;
-	extraArgs?: string[];
+	auth?: RequestAuth;
 }
 
 // SSRF guard: web_fetch must never reach loopback, private, or reserved addresses.
@@ -239,10 +241,14 @@ async function curlRequest(
 	options: RequestOptions,
 ): Promise<CurlResponse> {
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+	const auth = options.auth;
+	const authArgs = !auth ? [] : auth.kind === "bearer"
+		? ["-H", `Authorization: Bearer ${auth.token}`]
+		: ["--user", auth.credentials];
 	const result = await pi.exec("curl", [
 		...commonCurlArgs(protocols, maxBytes, timeoutMs),
 		...curlResolveArgs(url, addresses),
-		...(options.extraArgs ?? []),
+		...authArgs,
 		"--output", "-", "--write-out", `%{stderr}${CURL_META_MARKER}%{json}`, "--url", url.toString(),
 	], { signal, timeout: timeoutMs + 5000 });
 	if (result.code !== 0) {
@@ -275,6 +281,9 @@ export async function fetchPublic(
 		if (!response.location) throw new Error("The server returned a redirect without a Location header");
 		if (redirects >= MAX_REDIRECTS) throw new Error(`Too many redirects (maximum ${MAX_REDIRECTS})`);
 		const next = parseWebUrl(response.location, resolved.url);
+		if (options.auth && next.origin !== initialUrl.origin) {
+			throw new Error("Authenticated requests cannot follow cross-origin redirects");
+		}
 		if (protocols === "=https" && next.protocol !== "https:") {
 			throw new Error("Redirects must remain on HTTPS");
 		}

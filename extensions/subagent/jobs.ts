@@ -17,6 +17,7 @@ import {
 	getResultOutput,
 	isFailedResult,
 	sanitizeBounded,
+	substitutePrevious,
 	truncateTaskOutput,
 	truncateUtf8,
 } from "./text.ts";
@@ -52,6 +53,7 @@ interface JobTask extends JobItem {
 	result?: SingleResult;
 	/** Last recorded context size, persisted so the resume guard also works after a restart. */
 	contextTokens?: number;
+	activity?: "queued" | "running";
 	control?: ChildControl;
 }
 
@@ -308,8 +310,9 @@ export class JobStore {
 
 	private taskState(job: BackgroundJob, task: JobTask): SubagentJobTaskState {
 		if (task.completed) return "succeeded";
+		if (task.activity === "queued") return "pending";
+		if (task.activity === "running") return "running";
 		if (task.result && isFailedResult(task.result)) return "failed";
-		if (job.status === "running" && task.attempts > 0) return "running";
 		if (task.attempts > 0 && task.output && job.status !== "canceled") return "failed";
 		return "pending";
 	}
@@ -471,7 +474,6 @@ export class JobStore {
 	private async run(job: BackgroundJob, ctx: ExtensionContext, continuation?: string): Promise<void> {
 		if (job.status === "running") return;
 		const runGeneration = this.generation;
-		const knownTools = knownToolCatalog(this.pi);
 		job.status = "running";
 		job.finishedAt = undefined;
 		job.runtimeGeneration = runGeneration;
@@ -480,67 +482,73 @@ export class JobStore {
 		this.persistState(job);
 
 		try {
-			const executeTask = async (task: JobTask, index: number, prompt: string): Promise<SingleResult> => {
-				const isPersistedResume = task.attempts > 0;
-				task.attempts++;
-				task.completed = false;
-				task.output = undefined;
-				task.result = undefined;
-				task.control = undefined;
-				if (!isPersistedResume) {
-					task.model ??= resolveChildInvocation(ctx, task, knownTools).model ?? getContextModel(ctx);
+			const executeTask = async (task: JobTask, index: number, original: string): Promise<SingleResult> => {
+				task.activity = "queued";
+				try {
+					const result = await this.semaphore.with(controller.signal, async () => {
+						if (!this.isJobRuntimeCurrent(job, runGeneration)) throw new Error("Subagent runtime was retired");
+						const isPersistedResume = task.attempts > 0;
+						const prompt = isPersistedResume
+							? `${continuation?.trim() || "Continue the previous task from its persisted session."}\n\nOriginal task:\n${original}`
+							: original;
+						if (!isPersistedResume) task.model ??= getContextModel(ctx);
+						const selectedModel = task.model ?? (isPersistedResume ? null : undefined);
+						const provider = selectedModel?.includes("/")
+							? selectedModel.split("/", 1)[0]
+							: ctx.model?.provider;
+						task.activity = "running";
+						task.attempts++;
+						task.output = undefined;
+						task.result = undefined;
+						this.persistState(job, index);
+						return this.whileRunning(
+							task.title,
+							ctx,
+							(onStatusUpdate) =>
+								runChild({
+									defaultCwd: job.defaultCwd,
+									task: prompt,
+									cwd: task.cwd,
+									step: job.mode === "chain" ? index + 1 : undefined,
+									signal: controller.signal,
+									sessionId: task.sessionId,
+									inheritedModel: selectedModel,
+									provider,
+									providerEnvNames: providerEnvNames(provider, ctx),
+									thinking: task.thinking,
+									tools: task.tools,
+									systemPrompt: task.systemPrompt,
+									makeDetails: (results) => ({ ...this.details(job), results }),
+									onStatusUpdate: (updated) => {
+										if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
+										const observedModel = effectiveModel(updated.provider, updated.model);
+										if (observedModel && observedModel !== task.model) {
+											task.model = observedModel;
+											this.persistState(job, index);
+										}
+										onStatusUpdate(updated);
+									},
+									onControlChange: (control) => {
+										if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
+										task.control = control;
+									},
+								}),
+							task.model,
+							task.thinking,
+						);
+					});
+					if (!this.isJobRuntimeCurrent(job, runGeneration)) return result;
+					task.result = result;
+					task.contextTokens = result.usage.contextTokens;
+					task.output = sanitizeBounded(getResultOutput(result), PERSISTED_TASK_OUTPUT_CAP, "Persisted task output truncated");
+					task.model = effectiveModel(result.provider, result.model) ?? task.model;
+					task.completed = !isFailedResult(result);
+					this.persistState(job, index);
+					return result;
+				} finally {
+					task.activity = undefined;
+					task.control = undefined;
 				}
-				if (!this.isJobRuntimeCurrent(job, runGeneration)) throw new Error("Subagent runtime was retired");
-				this.persistState(job, index);
-				const selectedModel = isPersistedResume && !task.model ? null : task.model;
-				const provider = selectedModel?.includes("/")
-					? selectedModel.split("/", 1)[0]
-					: ctx.model?.provider;
-				const result = await this.semaphore.with(controller.signal, () =>
-					this.whileRunning(
-						task.title,
-						ctx,
-						(onStatusUpdate) =>
-							runChild({
-								defaultCwd: job.defaultCwd,
-								task: prompt,
-								cwd: task.cwd,
-								step: job.mode === "chain" ? index + 1 : undefined,
-								signal: controller.signal,
-								sessionId: task.sessionId,
-								inheritedModel: selectedModel,
-								provider,
-								providerEnvNames: providerEnvNames(provider, ctx),
-								thinking: task.thinking,
-								tools: task.tools,
-								systemPrompt: task.systemPrompt,
-								makeDetails: (results) => ({ ...this.details(job), results }),
-								onStatusUpdate: (updated) => {
-									if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
-									const observedModel = effectiveModel(updated.provider, updated.model);
-									if (observedModel && observedModel !== task.model) {
-										task.model = observedModel;
-										this.persistState(job, index);
-									}
-									onStatusUpdate(updated);
-								},
-								onControlChange: (control) => {
-									if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
-									task.control = control;
-								},
-							}),
-						task.model,
-						task.thinking,
-					),
-				);
-				if (!this.isJobRuntimeCurrent(job, runGeneration)) return result;
-				task.result = result;
-				task.contextTokens = result.usage.contextTokens;
-				task.output = sanitizeBounded(getResultOutput(result), PERSISTED_TASK_OUTPUT_CAP, "Persisted task output truncated");
-				task.model = effectiveModel(result.provider, result.model) ?? task.model;
-				task.completed = !isFailedResult(result);
-				this.persistState(job, index);
-				return result;
 			};
 
 			if (job.mode === "chain") {
@@ -550,23 +558,15 @@ export class JobStore {
 						previousOutput = task.output ?? previousOutput;
 						continue;
 					}
-					const original = task.task.replace(/\{previous\}/g, previousOutput);
-					const prompt = task.attempts > 0
-						? `${continuation?.trim() || "Continue the previous task from its persisted session."}\n\nOriginal task:\n${original}`
-						: original;
-					const result = await executeTask(task, index, prompt);
+					const original = substitutePrevious(task.task, previousOutput);
+					const result = await executeTask(task, index, original);
 					if (isFailedResult(result)) break;
 					previousOutput = getResultOutput(result);
 				}
 			} else {
 				const pending = job.tasks.map((task, index) => ({ task, index })).filter(({ task }) => !task.completed);
 				// allSettled: a rejected (e.g. queue-canceled) task must not finalize the job while siblings are still running.
-				await Promise.allSettled(pending.map(({ task, index }) => {
-					const prompt = task.attempts > 0
-						? `${continuation?.trim() || "Continue the previous task from its persisted session."}\n\nOriginal task:\n${task.task}`
-						: task.task;
-					return executeTask(task, index, prompt);
-				}));
+				await Promise.allSettled(pending.map(({ task, index }) => executeTask(task, index, task.task)));
 			}
 
 			if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
@@ -577,7 +577,7 @@ export class JobStore {
 		} catch (error) {
 			if (!this.isJobRuntimeCurrent(job, runGeneration)) return;
 			job.status = this.shuttingDown ? "interrupted" : controller.signal.aborted ? "canceled" : "interrupted";
-			const pending = job.tasks.find((task) => !task.completed);
+			const pending = controller.signal.aborted ? undefined : job.tasks.find((task) => !task.completed);
 			if (pending) {
 				pending.output = sanitizeBounded(
 					error instanceof Error ? error.message : String(error),

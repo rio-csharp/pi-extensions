@@ -13,7 +13,7 @@ export function createSearxngProvider(config: SearxngProviderConfig): SearchProv
 			url.searchParams.set("format", "json");
 			return {
 				url: url.toString(),
-				extraArgs: config.basicAuth ? ["--user", config.basicAuth] : undefined,
+				auth: config.basicAuth ? { kind: "basic", credentials: config.basicAuth } : undefined,
 				allowHttp: url.protocol === "http:",
 			};
 		},

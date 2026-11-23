@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import type { ExtensionAPI, Theme } from "@earendil-works/pi-coding-agent";
-import { visibleWidth } from "@earendil-works/pi-tui";
+import { Text, visibleWidth } from "@earendil-works/pi-tui";
 import { countOutputLines } from "./built-in-tools.ts";
 import compactToolUi from "./index.ts";
 import {
@@ -143,6 +143,57 @@ test("collapses back to nothing and never repeats the header when expanded", () 
 		lastComponent: expanded,
 	} as never);
 	assert.deepEqual(collapsed.render(60), [], "collapsing must clear the expanded view");
+});
+
+test("expanded delegates reuse only their own component and share row state", () => {
+	const call = new Text("", 0, 0);
+	const result = new Text("", 0, 0);
+	let delegateState: CompactRenderState | undefined;
+	let renders = 0;
+	const base = callContext({ path: "src/app.ts" });
+	const renderer = createCompactRenderer("read", (args) => String(args.path), {
+		expanded: () => ({
+			renderCall(_args, _theme, context) {
+				assert.equal(context.lastComponent, renders === 0 ? undefined : call);
+				assert.notEqual(context.state, base.state);
+				delegateState ??= context.state;
+				assert.equal(context.state, delegateState);
+				call.setText(`CALL ${++renders}`);
+				return call;
+			},
+			renderResult(_result, _options, _theme, context) {
+				assert.equal(context.lastComponent, renders === 1 ? undefined : result);
+				assert.equal(context.state, delegateState);
+				result.setText(`RESULT ${renders}`);
+				return result;
+			},
+		}),
+	});
+	const expandedCall = renderer.renderCall(base.args, identityTheme, { ...base, expanded: true });
+	const expandedResult = renderer.renderResult({}, { isPartial: false }, identityTheme, { ...base, expanded: true });
+	assert.deepEqual(expandedCall.render(80).slice(1).map((line) => line.trimEnd()), ["CALL 1"]);
+	assert.deepEqual(expandedResult.render(80).map((line) => line.trimEnd()), ["RESULT 1"]);
+
+	const collapsedCall = renderer.renderCall(base.args, identityTheme, { ...base, lastComponent: expandedCall });
+	const collapsedResult = renderer.renderResult({}, { isPartial: false }, identityTheme, {
+		...base,
+		lastComponent: expandedResult,
+	});
+	assert.equal(collapsedCall.render(80).length, 1);
+	assert.deepEqual(collapsedResult.render(80), []);
+
+	const reopenedCall = renderer.renderCall(base.args, identityTheme, {
+		...base,
+		expanded: true,
+		lastComponent: collapsedCall,
+	});
+	const reopenedResult = renderer.renderResult({}, { isPartial: false }, identityTheme, {
+		...base,
+		expanded: true,
+		lastComponent: collapsedResult,
+	});
+	assert.deepEqual(reopenedCall.render(80).slice(1).map((line) => line.trimEnd()), ["CALL 2"]);
+	assert.deepEqual(reopenedResult.render(80).map((line) => line.trimEnd()), ["RESULT 2"]);
 });
 
 const identityTheme = {

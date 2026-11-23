@@ -43,7 +43,7 @@ export async function runSearch(
 	const doFetch: SearchFetch = searchFetch ?? (async (request) => {
 		const fetched = await fetchPublic(pi, parseWebUrl(request.url), request.allowHttp ? "=http,https" : "=https", SEARCH_TRANSFER_BYTES, signal, {
 			timeoutMs: SEARCH_ATTEMPT_TIMEOUT_MS,
-			extraArgs: request.extraArgs,
+			auth: request.auth,
 		});
 		return { body: fetched.body };
 	});

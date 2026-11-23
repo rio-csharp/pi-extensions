@@ -13,11 +13,10 @@ import {
 } from "./client.ts";
 import { loadReferenceImages, resolveOutputDir, saveImage } from "./files.ts";
 
-/** 1x1 PNG signature followed by a 33-byte IHDR carrying the given size. */
+/** Minimal PNG header fixture carrying the given size. */
 function pngBytes(width: number, height: number): Buffer {
 	const buffer = Buffer.alloc(33);
-	buffer.writeUInt8(0x89, 0);
-	buffer.write("PNG", 1, "latin1");
+	buffer.write("\x89PNG\r\n\x1a\n", "latin1");
 	buffer.writeUInt32BE(width, 16);
 	buffer.writeUInt32BE(height, 20);
 	return buffer;
@@ -55,7 +54,11 @@ test("sniffMimeType reads magic bytes instead of trusting the request", () => {
 	const webp = Buffer.from([0x52, 0x49, 0x46, 0x46, 0, 0, 0, 0, 0x57, 0x45, 0x42, 0x50]);
 	assert.equal(sniffMimeType(webp), "image/webp");
 	assert.equal(sniffMimeType(Buffer.from("GIF89a")), "image/gif");
-	assert.equal(sniffMimeType(Buffer.from("nope")), "application/octet-stream");
+	assert.equal(sniffMimeType(Buffer.from("GIF87a")), "image/gif");
+	for (const bytes of ["nope", "xPNGxxxx", "GIF89x"]) {
+		assert.equal(sniffMimeType(Buffer.from(bytes)), "application/octet-stream");
+	}
+	assert.throws(() => extensionFor("application/octet-stream"), /unsupported image format/);
 	assert.equal(extensionFor("image/jpeg"), "jpg");
 	assert.equal(extensionFor("image/webp"), "webp");
 });
@@ -134,8 +137,12 @@ test("requestImage posts JSON, decodes base64, and reports usage", async () => {
 		);
 	}) as typeof fetch;
 
-	const result = await requestImage(baseRequest({ fetchImpl, size: " 1024x1024 " }));
-	assert.equal(calls[0]?.url, "https://api.example/v1/images/generations");
+	const result = await requestImage(baseRequest({
+		fetchImpl,
+		size: " 1024x1024 ",
+		baseUrl: "https://api.example/relay%2Ftenant/v1///?route=a%2Fb&route=b/#settings",
+	}));
+	assert.equal(calls[0]?.url, "https://api.example/relay%2Ftenant/v1/images/generations?route=a%2Fb&route=b/");
 	assert.equal(calls[0]?.headers.authorization, "Bearer sk-test");
 	const body = JSON.parse(calls[0]!.body);
 	assert.equal(body.model, "gpt-image-2.6-flare");
@@ -191,26 +198,50 @@ test("requestImage rejects URL-only responses", async () => {
 	await assert.rejects(() => requestImage(baseRequest({ fetchImpl })), /returned a URL instead of base64/);
 });
 
+test("requestImage rejects unsupported bytes without retrying or returning a partial batch", async () => {
+	let calls = 0;
+	const fetchImpl: typeof fetch = async () => {
+		calls += 1;
+		return Response.json({ data: [
+			{ b64_json: pngBytes(8, 8).toString("base64") },
+			{ b64_json: Buffer.from("<html>not an image</html>").toString("base64") },
+		] });
+	};
+	await assert.rejects(() => requestImage(baseRequest({ fetchImpl })), /unsupported image data/);
+	assert.equal(calls, 1);
+});
+
+test("requestImage rejects unsafe or invalid base URLs before fetching", async () => {
+	const fetchImpl: typeof fetch = async () => assert.fail("invalid base URL reached fetch");
+	for (const baseUrl of ["/v1", "file:///v1", "https://user:pass@api.example/v1"]) {
+		await assert.rejects(() => requestImage(baseRequest({ baseUrl, fetchImpl })), /base URL/);
+	}
+});
+
 test("requestImage sends edits as multipart", async () => {
+	let url: string | undefined;
 	let isForm = false;
 	let fieldNames: string[] = [];
-	const fetchImpl = (async (_url: string | URL | Request, init?: RequestInit) => {
+	const fetchImpl: typeof fetch = async (input, init) => {
+		url = String(input);
 		isForm = init?.body instanceof FormData;
 		const form = init?.body as FormData;
 		fieldNames = [...form.keys()];
 		return new Response(JSON.stringify({ data: [{ b64_json: pngBytes(8, 8).toString("base64") }] }), {
 			status: 200,
 		});
-	}) as typeof fetch;
+	};
 
 	await requestImage(
 		baseRequest({
 			fetchImpl,
+			baseUrl: "https://api.example/v1/?tenant=blue#settings",
 			images: [{ data: new Uint8Array(pngBytes(8, 8)), mimeType: "image/png", filename: "ref.png" }],
 			complexity: "low",
 			outputFormat: "webp",
 		}),
 	);
+	assert.equal(url, "https://api.example/v1/images/edits?tenant=blue");
 	assert.equal(isForm, true);
 	assert.deepEqual(fieldNames.sort(), ["complexity", "image", "model", "output_format", "prompt", "quality", "size"]);
 });

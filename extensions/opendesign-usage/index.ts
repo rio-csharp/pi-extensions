@@ -108,12 +108,12 @@ async function loadConfig(): Promise<UsageConfig | undefined> {
 	};
 }
 
-async function getJson<T>(path: string, cfg: UsageConfig): Promise<T | undefined> {
+async function getJson<T>(path: string, cfg: UsageConfig, signal: AbortSignal): Promise<T | undefined> {
 	try {
 		const res = await fetch(`${cfg.apiUrl}${path}`, {
 			headers: { Accept: "application/json", Authorization: `Bearer ${cfg.controlKey}` },
 			redirect: "error",
-			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
+			signal: AbortSignal.any([signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
 		});
 		if (!res.ok) return undefined;
 		return (await res.json()) as T;
@@ -140,50 +140,68 @@ function formatWindowLabel(durationSeconds: unknown): string | undefined {
 	return minutes > 0 ? `${minutes}m` : undefined;
 }
 
-function isActiveProvider(ctx: ExtensionContext, cfg: UsageConfig): boolean {
-	const provider = ctx.model?.provider;
-	return typeof provider === "string" && cfg.providers.has(provider);
-}
-
 function clearStatus(ctx: ExtensionContext): void {
 	if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 }
 
-let cachedWorkspaceId: string | undefined;
+interface UsageSession {
+	ctx: ExtensionContext;
+	manager: ExtensionContext["sessionManager"];
+	config?: UsageConfig;
+	cachedWorkspaceId?: string;
+	lastAgentEndRefresh: number;
+	pending?: { controller: AbortController; promise: Promise<void> };
+}
 
-async function resolveWorkspaceId(cfg: UsageConfig): Promise<string | undefined> {
+function sameConfig(a: UsageConfig | undefined, b: UsageConfig | undefined): boolean {
+	if (!a || !b) return a === b;
+	return a.controlKey === b.controlKey && a.apiUrl === b.apiUrl &&
+		a.workspaceId === b.workspaceId && a.refreshIntervalMs === b.refreshIntervalMs &&
+		a.providers.size === b.providers.size && [...a.providers].every(id => b.providers.has(id));
+}
+
+async function resolveWorkspaceId(session: UsageSession, cfg: UsageConfig, signal: AbortSignal): Promise<string | undefined> {
 	if (cfg.workspaceId) return cfg.workspaceId;
-	if (cachedWorkspaceId) return cachedWorkspaceId;
-	const current = await getJson<WorkspaceCurrent>("/api/v1/workspaces/current", cfg);
+	if (session.cachedWorkspaceId) return session.cachedWorkspaceId;
+	const current = await getJson<WorkspaceCurrent>("/api/v1/workspaces/current", cfg, signal);
+	if (signal.aborted) return undefined;
 	const id =
 		typeof current?.activeWorkspaceId === "string" && current.activeWorkspaceId.trim()
 			? current.activeWorkspaceId.trim()
 			: typeof current?.workspaceId === "string" && current.workspaceId.trim()
 				? current.workspaceId.trim()
 				: undefined;
-	if (id) cachedWorkspaceId = id;
+	if (id) session.cachedWorkspaceId = id;
 	return id;
 }
 
-async function poll(ctx: ExtensionContext): Promise<void> {
+async function poll(session: UsageSession, signal: AbortSignal): Promise<void> {
+	const ctx = session.ctx;
 	if (!ctx.hasUI) return;
+	const model = ctx.model;
+	const provider = model?.provider;
+	const modelId = model?.id;
 	const cfg = await loadConfig();
-	if (!cfg || !isActiveProvider(ctx, cfg)) {
+	if (signal.aborted || ctx.model?.provider !== provider || ctx.model?.id !== modelId) return;
+	if (!sameConfig(session.config, cfg)) session.cachedWorkspaceId = undefined;
+	session.config = cfg;
+	if (!cfg || !provider || !cfg.providers.has(provider)) {
 		clearStatus(ctx);
 		return;
 	}
 
-	const workspaceId = await resolveWorkspaceId(cfg);
-	if (!workspaceId) return;
-	const modelId = ctx.model?.id;
-	const query = typeof modelId === "string" && modelId ? `?modelId=${encodeURIComponent(modelId)}` : "";
+	const workspaceId = await resolveWorkspaceId(session, cfg, signal);
+	if (signal.aborted || !workspaceId) return;
+	const query = modelId ? `?modelId=${encodeURIComponent(modelId)}` : "";
 	const preflight = await getJson<Preflight>(
 		`/api/v1/workspaces/${encodeURIComponent(workspaceId)}/billing/preflight${query}`,
 		cfg,
+		signal,
 	);
+	if (signal.aborted || ctx.model?.provider !== provider || ctx.model?.id !== modelId) return;
 	if (!preflight) {
 		// A cached workspace that no longer answers (moved/deleted) should be re-resolved next time.
-		if (!cfg.workspaceId) cachedWorkspaceId = undefined;
+		if (!cfg.workspaceId) session.cachedWorkspaceId = undefined;
 		return;
 	}
 
@@ -211,69 +229,69 @@ async function poll(ctx: ExtensionContext): Promise<void> {
 	const worst = Math.min(...parts.map(part => part.percent));
 	const color = worst <= 0 ? "error" : worst <= 10 ? "warning" : "muted";
 
-	// The model may have switched, or the session may have ended, while the request was in flight.
-	if (!isActiveProvider(ctx, cfg)) return;
 	ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, parts.map(part => part.text).join(" ")));
 }
 
-const inFlight = new WeakMap<ExtensionContext, Promise<void>>();
-
-function refresh(ctx: ExtensionContext): Promise<void> {
-	const existing = inFlight.get(ctx);
-	if (existing) return existing;
-	const pending = poll(ctx)
+function refresh(session: UsageSession): Promise<void> {
+	if (session.pending) return session.pending.promise;
+	const controller = new AbortController();
+	const promise = poll(session, controller.signal)
 		.catch(() => {})
 		.finally(() => {
-			inFlight.delete(ctx);
+			if (session.pending?.controller === controller) session.pending = undefined;
 		});
-	inFlight.set(ctx, pending);
-	return pending;
+	session.pending = { controller, promise };
+	return promise;
 }
 
 export default function (pi: ExtensionAPI) {
 	let timer: ReturnType<typeof setTimeout> | undefined;
-	let sessionToken = 0;
-	let lastAgentEndRefresh = 0;
+	let active: UsageSession | undefined;
 
-	function stopTimer(): void {
-		sessionToken += 1;
-		if (timer) clearTimeout(timer);
+	function stop(): void {
+		active?.pending?.controller.abort();
+		active = undefined;
+		clearTimeout(timer);
 		timer = undefined;
 	}
 
-	function schedule(ctx: ExtensionContext, token: number, delayMs: number): void {
-		if (token !== sessionToken) return;
-		if (timer) clearTimeout(timer);
-		timer = setTimeout(() => void cycle(ctx, token), delayMs);
-	}
-
-	async function cycle(ctx: ExtensionContext, token: number): Promise<void> {
-		if (token !== sessionToken) return;
-		await refresh(ctx);
-		if (token !== sessionToken) return;
-		const cfg = await loadConfig();
-		schedule(ctx, token, cfg?.refreshIntervalMs ?? DEFAULT_REFRESH_MS);
+	async function cycle(session: UsageSession): Promise<void> {
+		if (active !== session) return;
+		do {
+			await refresh(session);
+		} while (active === session && session.pending);
+		if (active !== session) return;
+		timer = setTimeout(() => void cycle(session), session.config?.refreshIntervalMs ?? DEFAULT_REFRESH_MS);
 	}
 
 	pi.on("session_start", (_event, ctx) => {
-		stopTimer();
-		if (ctx.mode !== "tui") return;
-		const token = sessionToken;
-		void cycle(ctx, token);
+		stop();
+		active = { ctx, manager: ctx.sessionManager, lastAgentEndRefresh: -Infinity };
+		if (ctx.mode === "tui") void cycle(active);
 	});
 
-	pi.on("model_select", (_event, ctx) => {
-		void refresh(ctx);
+	pi.on("model_select", (event, ctx) => {
+		if (!active || active.manager !== ctx.sessionManager) return;
+		active.pending?.controller.abort();
+		active.pending = undefined;
+		active.ctx = ctx;
+		if (event.previousModel?.provider !== event.model.provider || event.previousModel?.id !== event.model.id) {
+			clearStatus(ctx);
+		}
+		void refresh(active);
 	});
 
 	pi.on("agent_end", (_event, ctx) => {
-		if (Date.now() - lastAgentEndRefresh < AGENT_END_THROTTLE_MS) return;
-		lastAgentEndRefresh = Date.now();
-		void refresh(ctx);
+		if (!active || active.manager !== ctx.sessionManager || !ctx.hasUI) return;
+		const now = Date.now();
+		if (now - active.lastAgentEndRefresh < AGENT_END_THROTTLE_MS) return;
+		active.lastAgentEndRefresh = now;
+		void refresh(active);
 	});
 
 	pi.on("session_shutdown", (_event, ctx) => {
-		stopTimer();
+		if (!active || active.manager !== ctx.sessionManager) return;
+		stop();
 		clearStatus(ctx);
 	});
 }
