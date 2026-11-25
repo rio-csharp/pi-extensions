@@ -1,6 +1,6 @@
 # imagegen
 
-Adds two LLM-callable tools for an OpenAI-compatible `/v1/images/generations` and `/v1/images/edits` provider:
+Adds two LLM-callable tools for an OpenAI-compatible `/v1/images/generations` and `/v1/images/edits` provider, plus the SenseNova `sensenova-u1.x` image API:
 
 - `generate_image` queues a background job and returns a `jobId` immediately. Pi can keep responding while the provider works.
 - `imagegen_result` takes a `jobId` and returns the status without waiting. A completed job returns its image, path, and actual dimensions so the model can inspect it or make an edit.
@@ -19,8 +19,17 @@ D:\project\generated\20261118-142033-flare-9f3ac1.png · 1254x1254 · 1812KB
 
 ```json
 {
-  "provider": "ai-pixel",
   "defaultModel": "flare",
+  "providers": {
+    "ai-pixel": {
+      "api": "openai",
+      "baseUrl": "https://api.ai-pixel.online/v1",
+      "apiKey": "$IMAGEGEN_API_KEY"
+    }
+  },
+  "models": {
+    "flare": { "provider": "ai-pixel", "id": "gpt-image-2.6-flare", "quality": "medium" }
+  },
   "defaultQuality": "medium",
   "defaultSize": "1024x1024",
   "pricePerImage": 0.02,
@@ -29,13 +38,23 @@ D:\project\generated\20261118-142033-flare-9f3ac1.png · 1254x1254 · 1812KB
 }
 ```
 
-Credentials come from an existing `relay-providers.json` entry when `provider` names one; `baseUrl` and `apiKey` set here override it. Without either, `$IMAGEGEN_BASE_URL` and `$IMAGEGEN_API_KEY` are used. `apiKey` accepts a `$ENV_VAR` reference, so no secret has to be stored in the file.
+`providers` is the whole credential story: one entry per vendor, each with its own `api`, `baseUrl` and `apiKey`. Nothing is inherited between entries and no other file is read — `relay-providers.json` is not consulted at all. `apiKey` accepts a `$ENV_VAR` reference, so no secret has to be stored here; an unset reference counts as missing rather than being used literally.
 
 `baseUrl` must include the API version segment, for example `https://api.ai-pixel.online/v1`. The extension appends the image route to the URL path, preserves query parameters, and discards the fragment.
 
+### Providers
+
+| Key | Meaning |
+|---|---|
+| `api` | `"openai"` (default) or `"sensenova"` — which request shape and size rules this endpoint speaks. |
+| `baseUrl` | Required. The endpoint, including the version segment. |
+| `apiKey` | The key for this endpoint. `"$ENV_VAR"` / `"${ENV_VAR}"` is expanded. |
+
+There is no `defaultProvider`: every model entry names its own `provider`, so the default model and the default endpoint cannot disagree. A model without a provider is reported by name rather than guessed onto somebody else's endpoint. A provider with an invalid `baseUrl` is skipped with a warning, and a model pointing at a provider that is not defined is reported by name too.
+
 ### Models
 
-`models` maps an alias to a provider model id plus a **`description` that is sent to the model**, so it can choose the right one on its own:
+`models` maps an alias to a `provider`, a model id, and a **`description` that is sent to the model**, so it can choose the right one on its own:
 
 ```json
 {
@@ -56,23 +75,79 @@ Credentials come from an existing `relay-providers.json` entry when `provider` n
 
 Both entries ship as defaults. Aliases you add are appended; `defaultModel` picks the one used when the model omits `model`. A per-entry `quality` becomes that model's default, and a per-entry `pricePerImage` overrides the top-level price. The tool description and the `model` argument description are generated from these entries at extension load, so `/reload` after editing them.
 
+### Two vendors in one file
+
+Each `api` value lives in its own file, and everything that API decides on its own — size rules, request payload, the argument check — is in that file rather than in the tools:
+
+| File | API |
+|---|---|
+| `dialects/openai.ts` | OpenAI-compatible `/v1/images/generations` and `/v1/images/edits`, JSON for generations and multipart for edits. |
+| `dialects/sensenova.ts` | SenseNova `sensenova-u1.x`, JSON only, references inlined as data URLs. |
+
+They implement the contract in `dialects/types.ts`, and `client.ts` holds only transport, retries and response parsing.
+
+Keeping vendors apart is just two provider entries. This is the shape that runs SenseNova beside an OpenAI relay:
+
+```json
+{
+  "defaultModel": "nova",
+  "providers": {
+    "ai-pixel": {
+      "api": "openai",
+      "baseUrl": "https://api.ai-pixel.online/v1",
+      "apiKey": "$IMAGEGEN_API_KEY"
+    },
+    "sensenova": {
+      "api": "sensenova",
+      "baseUrl": "https://token.sensenova.cn/v1",
+      "apiKey": "$SENSENOVA_API_KEY"
+    }
+  },
+  "models": {
+    "flare":    { "provider": "ai-pixel",  "id": "gpt-image-2.6-flare",   "quality": "medium" },
+    "sunburst": { "provider": "ai-pixel",  "id": "gpt-image-2.6-sunburst", "quality": "high" },
+    "nova":     { "provider": "sensenova", "id": "sensenova-u1.6-lite",   "pricePerImage": 0 }
+  }
+}
+```
+
+A key never crosses providers: the `ai-pixel` key cannot reach `token.sensenova.cn`, because a model only ever sees the endpoint and key of the provider it names.
+
 ## Parameters
 
 | Parameter | Notes |
 |---|---|
 | `prompt` | Required, up to 32k characters. Quote text that must appear verbatim and say where it goes. |
 | `model` | Alias from `models`, defaults to `defaultModel`. |
-| `size` | `1024x1024`, `1024x1536`, `1536x1024`, `auto`, or `WIDTHxHEIGHT` with multiples of 16, max edge 3840, ≤3:1 ratio, 0.65–8.3 MP. Validated locally. |
-| `quality` | `low`, `medium`, `high` (default `medium`), plus `xhigh`/`max` on 2.6. |
-| `background` | `auto`, `transparent`, `opaque`; transparency needs png/webp. |
+| `size` | OpenAI models: `1024x1024`, `1024x1536`, `1536x1024`, `auto`, or `WIDTHxHEIGHT` with multiples of 16, max edge 3840, ≤3:1 ratio, 0.65–8.3 MP. SenseNova models: `auto` or `WIDTHxHEIGHT` with multiples of 32, 512–4096 per side, ≤3:1; recommended `2048x2048`, `2720x1536`, `1536x2720`, `1664x2496`, `2496x1664`, `4096x4096` (4K). Validated locally per dialect. |
+| `quality` | `low`, `medium`, `high` (default `medium`), plus `xhigh`/`max` on 2.6. OpenAI models only. |
+| `background` | `auto`, `transparent`, `opaque`; transparency needs png/webp. OpenAI models only. |
 | `outputFormat` | `png` (default), `jpeg`, `webp`. |
-| `compression` | 0–100, jpeg/webp only. |
-| `moderation` | `auto`, `low`. |
-| `complexity` | `low`, `medium`, `high` — planning depth on 2.6. |
-| `images` | 1–16 reference paths; switches to the edit endpoint. |
+| `compression` | 0–100, jpeg/webp only. OpenAI models only. |
+| `moderation` | `auto`, `low`. OpenAI models only. |
+| `complexity` | `low`, `medium`, `high` — planning depth on 2.6. OpenAI models only. |
+| `watermark` | SenseNova only: draw the official SenseNova logo. Off by default here (the provider's own default is on); pass `true` when the logo is wanted. |
+| `promptExtend` | SenseNova only: let the provider enrich the prompt (provider default `true`). |
+| `selfCorrection` | SenseNova only: self-correction pass for text accuracy and quality (provider default `true`). |
+| `images` | 1–16 reference paths on OpenAI models; 1–5 on SenseNova. Switches to the edit endpoint. |
 | `outputDir` | Overrides `outputDir` for one call. |
 
+Passing an argument the selected dialect does not support fails fast with a message naming it, instead of silently sending a field the provider ignores.
+
 `/imagegen` prints the effective configuration.
+
+## SenseNova dialect
+
+Measured against `token.sensenova.cn` on 2026-11-24 with `sensenova-u1.6-lite`:
+
+- **It is a separate images API, not Chat Completions.** `/v1/images/generations` for text-to-image and `/v1/images/edits` for image-to-image; the model id is also listed by `/v1/models` with `output_modalities: ["image"]`.
+- **Edits are JSON, not multipart.** `{"images": [{"image_url": "data:image/png;base64,..."}]}`, first image is the primary edit target, at most five per request. Local files are read from disk and inlined as data URLs, so no upload endpoint is involved.
+- **`response_format` defaults to `b64_json`** and the extension always requests that. The alternative, `url`, returns a signed link that expires after 24 hours; the tool refuses a URL-only response rather than saving a link that will rot.
+- **`size` is either `auto` or `WIDTHxHEIGHT`** with multiples of 32, 512–4096 per side, at most 3:1. Recommended: `2048x2048` (1:1 2K), `2720x1536` (16:9 2K), `1536x2720` (9:16 2K), `1664x2496` (2:3 2K), `2496x1664` (3:2 2K), `4096x4096` (1:1 4K). `512x512` is legal here even though the OpenAI dialect rejects it.
+- **Extra knobs:** `watermark` (the provider defaults to `true`, but this extension sends `false` unless you pass `watermark: true`, because a logo is rarely what was asked for), `prompt_extend` (default `true`), `self_correction` (default `true`). The docs mark watermark-free output as free during public beta and likely to become paid, so the flag is always sent explicitly.
+- **`n` only accepts 1**, and there is no `quality`, `background`, `compression`, `moderation`, or `complexity`.
+- **Usage is token-based** (`input_tokens`/`output_tokens`, with image tokens counted for edits) and is reported in the result; billing is whatever the plan says, so set `pricePerImage` accordingly (the Token Plan is `0`).
+- **Latency:** ~17s for a 2048x2048 generation and ~23s for a 2048x2048 edit in testing. Jobs stay in the same background queue as OpenAI requests.
 
 ## Provider quirks this handles
 

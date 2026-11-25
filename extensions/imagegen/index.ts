@@ -9,7 +9,15 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import type { ImageContent, TextContent, Usage } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { readDimensions, requestImage, validateSize, type GeneratedImage, type ImageRequest } from "./client.ts";
+import {
+	MAX_REFERENCE_IMAGES,
+	dialectOf,
+	readDimensions,
+	requestImage,
+	validateSize,
+	type GeneratedImage,
+	type ImageRequest,
+} from "./client.ts";
 import {
 	BACKGROUNDS,
 	COMPLEXITIES,
@@ -19,24 +27,29 @@ import {
 	configProblem,
 	imageCostUsd,
 	loadImageGenConfig,
+	modelApi,
+	modelEndpoint,
+	modelProblem,
+	modelProvider,
 	type Background,
 	type Complexity,
+	type ImageApi,
 	type Moderation,
 	type OutputFormat,
 	type Quality,
 } from "./config.ts";
 import { loadReferenceImages, resolveOutputDir, saveImage, type SavedImage } from "./files.ts";
 import { ImageJobs } from "./jobs.ts";
-import { buildDescription, buildModelArgumentDescription, formatResultHeader } from "./prompt.ts";
+import { buildDescription, buildModelArgumentDescription, buildSizeArgumentDescription, formatResultHeader } from "./prompt.ts";
 
 const MAX_PROMPT_CHARS = 32_000;
-const MAX_REFERENCE_IMAGES = 16;
 
 interface ToolDetails {
 	phase: "queued" | "running" | "done" | "failed";
 	jobId: string;
 	model?: string;
 	quality?: string;
+	api?: ImageApi;
 	requestedSize?: string;
 	width?: number;
 	height?: number;
@@ -58,9 +71,15 @@ interface GenerateParams {
 	compression?: number;
 	moderation?: Moderation;
 	complexity?: Complexity;
+	watermark?: boolean;
+	promptExtend?: boolean;
+	selfCorrection?: boolean;
 	images?: string[];
 	outputDir?: string;
 }
+
+/** Tool arguments that only some image APIs understand. */
+const DIALECT_ARGUMENTS = ["quality", "background", "compression", "moderation", "complexity", "watermark", "promptExtend", "selfCorrection"] as const;
 
 function notifyConfigWarning(ctx: ExtensionContext | undefined, warning: string): void {
 	if (!ctx?.hasUI) return;
@@ -83,7 +102,7 @@ interface CompletedImageJob {
 }
 
 async function generate(
-	request: ImageRequest & { size: string; quality: string },
+	request: ImageRequest & { size: string; quality?: string },
 	cwd: string,
 	referencePaths: string[],
 	dir: string,
@@ -122,6 +141,7 @@ async function generate(
 		details: {
 			model: request.model,
 			quality: request.quality,
+			api: request.api,
 			requestedSize: request.size,
 			width: dimensions?.width,
 			height: dimensions?.height,
@@ -174,8 +194,7 @@ export default function (pi: ExtensionAPI) {
 			),
 			size: Type.Optional(
 				Type.String({
-					description:
-						'Output size: "1024x1024", "1024x1536", "1536x1024", "auto", or WIDTHxHEIGHT (multiples of 16, max edge 3840, at most 3:1). Defaults to the configured size.',
+					description: buildSizeArgumentDescription(startupConfig),
 				}),
 			),
 			quality: Type.Optional(
@@ -208,6 +227,24 @@ export default function (pi: ExtensionAPI) {
 						"How much the model plans before drawing (gpt-image-2.6 only). Same price at every level; omit to use the provider default.",
 				}),
 			),
+			watermark: Type.Optional(
+				Type.Boolean({
+					description:
+						"SenseNova models only: draw the official SenseNova logo. This tool defaults to false (clean image); pass true only when the logo is wanted.",
+				}),
+			),
+			promptExtend: Type.Optional(
+				Type.Boolean({
+					description:
+						"SenseNova models only: let the provider rewrite and enrich the prompt first. The provider default is true; pass false to use the prompt verbatim.",
+				}),
+			),
+			selfCorrection: Type.Optional(
+				Type.Boolean({
+					description:
+						"SenseNova models only: run a self-correction pass for text accuracy and overall quality. The provider default is true.",
+				}),
+			),
 			images: Type.Optional(
 				Type.Array(Type.String(), {
 					maxItems: MAX_REFERENCE_IMAGES,
@@ -223,13 +260,15 @@ export default function (pi: ExtensionAPI) {
 
 		renderCall(args, theme: Theme) {
 			const alias = typeof args.model === "string" ? args.model : startupConfig.defaultModel;
+			const api = modelApi(startupConfig, alias);
 			const size = typeof args.size === "string" ? args.size : startupConfig.defaultSize;
 			const quality = typeof args.quality === "string" ? args.quality : startupConfig.defaultQuality;
 			const prompt = typeof args.prompt === "string" ? args.prompt.replace(/\s+/g, " ").trim() : "";
 			const shown = prompt.length > 100 ? `${prompt.slice(0, 100)}…` : prompt;
 			const references = Array.isArray(args.images) && args.images.length > 0 ? ` · ${args.images.length} ref` : "";
+			const effort = dialectOf(api).hasQuality ? ` · ${quality}` : "";
 			const head = theme.fg("toolTitle", theme.bold("generate_image"));
-			const meta = theme.fg("dim", ` · ${alias} · ${size} · ${quality}${references}`);
+			const meta = theme.fg("dim", ` · ${alias} · ${size}${effort}${references}`);
 			return new Text(`${head}${meta}\n  ${shown}`, 0, 0);
 		},
 
@@ -255,27 +294,42 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const requestedSize = input.size?.trim() || config.defaultSize;
-			const sizeProblem = validateSize(requestedSize);
+			const api = modelApi(config, alias);
+			const dialect = dialectOf(api);
+			const endpoint = modelEndpoint(config, alias);
+			const endpointProblem = modelProblem(config, alias);
+			if (endpointProblem) throw new Error(`generate_image is not configured: ${endpointProblem}`);
+			const provided = DIALECT_ARGUMENTS.filter((name) => input[name] !== undefined);
+			const unsupported = provided.filter((name) => !dialect.arguments.includes(name));
+			if (unsupported.length > 0) {
+				throw new Error(
+					`model "${alias}" uses ${dialect.label}, which does not support ${unsupported.join(", ")}; supported arguments there are ${dialect.arguments.join(", ")}`,
+				);
+			}
+			const sizeProblem = validateSize(requestedSize, api);
 			if (sizeProblem) throw new Error(sizeProblem);
-			const quality = input.quality ?? model.quality ?? config.defaultQuality;
+			const quality = dialect.hasQuality ? input.quality ?? model.quality ?? config.defaultQuality : undefined;
 			const pricePerImage = model.pricePerImage ?? config.pricePerImage;
 			const outputFormat = input.outputFormat ?? "png";
-			if (input.compression !== undefined && outputFormat === "png") {
-				throw new Error('compression requires outputFormat "jpeg" or "webp"');
-			}
-			if (input.background === "transparent" && outputFormat === "jpeg") {
-				throw new Error('transparent background requires outputFormat "png" or "webp"');
-			}
+			const argumentProblem = dialect.checkArguments?.({
+				background: input.background,
+				outputFormat,
+				compression: input.compression,
+			});
+			if (argumentProblem) throw new Error(argumentProblem);
 
 			const referencePaths = input.images ?? [];
-			if (referencePaths.length > MAX_REFERENCE_IMAGES) {
-				throw new Error(`at most ${MAX_REFERENCE_IMAGES} reference images are supported`);
+			if (referencePaths.length > dialect.maxReferenceImages) {
+				throw new Error(
+					`${dialect.label} accepts at most ${dialect.maxReferenceImages} reference images`,
+				);
 			}
 			const cwd = ctx.cwd;
 			const dir = resolveOutputDir(cwd, input.outputDir ?? config.outputDir);
 			const request = {
-				baseUrl: config.baseUrl,
-				apiKey: config.apiKey,
+				baseUrl: endpoint.baseUrl!,
+				apiKey: endpoint.apiKey!,
+				api,
 				model: model.id,
 				prompt: input.prompt,
 				size: requestedSize,
@@ -285,6 +339,9 @@ export default function (pi: ExtensionAPI) {
 				outputCompression: input.compression,
 				moderation: input.moderation,
 				complexity: input.complexity,
+				watermark: input.watermark,
+				promptExtend: input.promptExtend,
+				selfCorrection: input.selfCorrection,
 				timeoutMs: config.timeoutMs,
 			};
 			const jobId = jobs.enqueue(
@@ -299,7 +356,7 @@ export default function (pi: ExtensionAPI) {
 			);
 			return {
 				content: [{ type: "text", text: `Queued image job ${jobId}. Generation continues in the background; the user will be notified. Use imagegen_result with this jobId only when you need the result.` }],
-				details: { phase: "queued", jobId, model: model.id, quality, requestedSize } satisfies ToolDetails,
+				details: { phase: "queued", jobId, model: model.id, quality, api, requestedSize } satisfies ToolDetails,
 			};
 		},
 	}));
@@ -340,16 +397,22 @@ export default function (pi: ExtensionAPI) {
 			const config = loadImageGenConfig(getAgentDir());
 			const problem = configProblem(config);
 			const lines = [
-				`provider: ${config.provider ?? "(none)"}`,
-				`base URL: ${config.baseUrl || "(unset)"}`,
-				`api key: ${config.apiKey ? "configured" : "(unset)"}`,
 				`default: ${config.defaultModel} · ${config.defaultQuality} · ${config.defaultSize}`,
 				`output dir: ${resolveOutputDir(ctx.cwd, config.outputDir)}`,
 				`timeout: ${Math.round(config.timeoutMs / 1000)}s`,
+				"providers:",
+				...Object.entries(config.providers).map(([name, provider]) => {
+					const key = provider.apiKey ? "key set" : "no key";
+					return `  ${name} · ${provider.api} · ${provider.baseUrl} · ${key}`;
+				}),
 				"models:",
-				...Object.entries(config.models).map(
-					([alias, model]) => `  ${alias} → ${model.id}${model.quality ? ` (quality ${model.quality})` : ""}`,
-				),
+				...Object.entries(config.models).map(([alias, model]) => {
+					const name = modelProvider(config, alias) ?? "(none)";
+					const api = modelApi(config, alias);
+					const quality = dialectOf(api).hasQuality && model.quality ? ` (quality ${model.quality})` : "";
+					const state = modelProblem(config, alias) ? " [missing credentials]" : "";
+					return `  ${alias} → ${model.id} · ${name} · ${api}${quality}${state}`;
+				}),
 			];
 			if (problem) lines.push(`status: not usable — ${problem}`);
 			if (config.warnings.length > 0) lines.push("warnings:", ...config.warnings.map((w) => `  ${w}`));

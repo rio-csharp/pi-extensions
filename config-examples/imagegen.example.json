@@ -1,6 +1,17 @@
 {
-  "provider": "your-relay-provider-id",
   "defaultModel": "flare",
+  "providers": {
+    "ai-pixel": {
+      "api": "openai",
+      "baseUrl": "https://your-relay.example/v1",
+      "apiKey": "$IMAGEGEN_API_KEY"
+    },
+    "sensenova": {
+      "api": "sensenova",
+      "baseUrl": "https://token.sensenova.cn/v1",
+      "apiKey": "$SENSENOVA_API_KEY"
+    }
+  },
   "defaultQuality": "medium",
   "defaultSize": "1024x1024",
   "pricePerImage": 0.02,
@@ -8,14 +19,22 @@
   "timeoutSeconds": 900,
   "models": {
     "flare": {
+      "provider": "ai-pixel",
       "id": "gpt-image-2.6-flare",
       "description": "Fast iteration: quicker and better at finished-looking layout; use it for drafts, variants and anything a user is waiting on.",
       "quality": "medium"
     },
     "sunburst": {
+      "provider": "ai-pixel",
       "id": "gpt-image-2.6-sunburst",
       "description": "Slower but more literal: honors requested element placement, keeps finer detail and drifts less across multi-round edits; use it for final assets and careful edits.",
       "quality": "high"
+    },
+    "nova": {
+      "provider": "sensenova",
+      "id": "sensenova-u1.6-lite",
+      "description": "SenseNova native image model: 2K/4K output, strong text rendering, optional logo watermark; set watermark=false for clean images.",
+      "pricePerImage": 0
     }
   }
 }

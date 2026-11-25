@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { defaultModels, imageCostUsd, loadImageGenConfig } from "./config.ts";
+import { defaultModels, imageCostUsd, loadImageGenConfig, modelApi, modelEndpoint, modelProblem, configProblem } from "./config.ts";
 
 function withAgentDir(
 	files: Record<string, unknown>,
@@ -31,63 +31,32 @@ function withAgentDir(
 	}
 }
 
-test("missing config yields built-in models and no warnings", () => {
+test("missing config yields built-in models, no providers and no warnings", () => {
 	withAgentDir({}, (dir) => {
 		const config = loadImageGenConfig(dir);
 		assert.deepEqual(config.warnings, []);
 		assert.deepEqual(Object.keys(config.models), ["flare", "sunburst"]);
 		assert.equal(config.models.flare?.id, "gpt-image-2.6-flare");
 		assert.equal(config.defaultModel, "flare");
-		assert.equal(config.baseUrl, "");
-		assert.equal(config.apiKey, "");
+		assert.deepEqual(config.providers, {});
+		// Built-in models name no provider, so nothing is sent anywhere until one is configured.
+		assert.match(modelProblem(config, "flare") ?? "", /names no provider/);
+		assert.match(configProblem(config) ?? "", /no providers/);
 	});
 });
 
-test("reuses relay-providers credentials by provider id", () => {
-	withAgentDir(
-		{
-			"imagegen.json": { provider: "ai-pixel" },
-			"relay-providers.json": {
-				providers: [
-					{ id: "other", baseUrl: "https://other.example/v1", apiKey: "nope" },
-					{ id: "ai-pixel", baseUrl: "https://api.ai-pixel.online/v1", apiKey: "sk-test" },
-				],
-			},
-		},
-		(dir) => {
-			const config = loadImageGenConfig(dir);
-			assert.equal(config.provider, "ai-pixel");
-			assert.equal(config.baseUrl, "https://api.ai-pixel.online/v1");
-			assert.equal(config.apiKey, "sk-test");
-			assert.deepEqual(config.warnings, []);
-		},
-	);
-});
-
-test("expands env references and warns on unknown providers", () => {
-	withAgentDir(
-		{
-			"imagegen.json": { provider: "missing" },
-			"relay-providers.json": {
-				providers: [{ id: "ai-pixel", baseUrl: "https://relay.example/v1", apiKey: "$IMAGEGEN_TEST_KEY" }],
-			},
-		},
-		(dir) => {
-			const config = loadImageGenConfig(dir);
-			assert.equal(config.warnings.length, 1);
-			assert.equal(config.apiKey, "");
-		},
-		{ IMAGEGEN_TEST_KEY: "sk-env" },
-	);
-});
-
-test("explicit baseUrl and apiKey override the provider", () => {
+test("providers hold baseUrl and apiKey, and models name one", () => {
 	withAgentDir(
 		{
 			"imagegen.json": {
-				provider: "ai-pixel",
-				baseUrl: "https://direct.example/v1/",
-				apiKey: "$IMAGEGEN_TEST_KEY",
+				providers: {
+					"ai-pixel": { baseUrl: "https://direct.example/v1/", apiKey: "$IMAGEGEN_TEST_KEY" },
+					sensenova: { api: "sensenova", baseUrl: "https://nova.example/v1", apiKey: "sk-nova" },
+				},
+				models: {
+					flare: { id: "gpt-image-2.6-flare", provider: "ai-pixel" },
+					nova: { id: "sensenova-u1.6-lite", provider: "sensenova" },
+				},
 			},
 			"relay-providers.json": {
 				providers: [{ id: "ai-pixel", baseUrl: "https://relay.example/v1", apiKey: "sk-relay" }],
@@ -95,10 +64,40 @@ test("explicit baseUrl and apiKey override the provider", () => {
 		},
 		(dir) => {
 			const config = loadImageGenConfig(dir);
-			assert.equal(config.baseUrl, "https://direct.example/v1");
-			assert.equal(config.apiKey, "sk-direct");
+			assert.deepEqual(config.warnings, []);
+			// The trailing slash is normalized away; relay-providers.json is never read.
+			assert.deepEqual(modelEndpoint(config, "flare"), {
+				provider: "ai-pixel",
+				baseUrl: "https://direct.example/v1",
+				apiKey: "sk-direct",
+			});
+			assert.deepEqual(modelEndpoint(config, "nova"), {
+				provider: "sensenova",
+				baseUrl: "https://nova.example/v1",
+				apiKey: "sk-nova",
+			});
+			assert.equal(modelApi(config, "flare"), "openai");
+			assert.equal(modelApi(config, "nova"), "sensenova");
 		},
 		{ IMAGEGEN_TEST_KEY: "sk-direct" },
+	);
+});
+
+test("an unset apiKey reference warns and leaves that provider without a key", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				providers: { nova: { api: "sensenova", apiKey: "$IMAGEGEN_TEST_MISSING_KEY", baseUrl: "https://nova.example/v1" } },
+				models: { nova: { id: "sensenova-u1.6-lite", provider: "nova" } },
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.equal(config.warnings.length, 1);
+			assert.match(config.warnings[0] ?? "", /apiKey reference is unset/);
+			assert.equal(config.providers.nova?.apiKey, "");
+			assert.match(modelProblem(config, "nova") ?? "", /provider "nova" has no API key/);
+		},
 	);
 });
 
@@ -167,6 +166,128 @@ test("price defaults to 0.02 per image and can be overridden", () => {
 	);
 });
 
+test("two providers let one config mix OpenAI and SenseNova models", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				defaultModel: "nova",
+				providers: {
+					"ai-pixel": { baseUrl: "https://api.ai-pixel.online/v1", apiKey: "sk-openai" },
+					sensenova: { api: "sensenova", baseUrl: "https://token.sensenova.cn/v1/", apiKey: "sk-nova" },
+				},
+				models: {
+					flare: { id: "gpt-image-2.6-flare", provider: "ai-pixel" },
+					nova: { id: "sensenova-u1.6-lite", provider: "sensenova", description: "2K/4K" },
+				},
+			},
+			"relay-providers.json": {
+				providers: [{ id: "ai-pixel", baseUrl: "https://relay.example/v1", apiKey: "sk-relay" }],
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.deepEqual(config.warnings, []);
+			assert.equal(modelApi(config, "nova"), "sensenova");
+			assert.equal(modelApi(config, "flare"), "openai");
+			// The trailing slash is normalized away before the request path is appended.
+			assert.deepEqual(modelEndpoint(config, "nova"), {
+				provider: "sensenova",
+				baseUrl: "https://token.sensenova.cn/v1",
+				apiKey: "sk-nova",
+			});
+			assert.deepEqual(modelEndpoint(config, "flare"), {
+				provider: "ai-pixel",
+				baseUrl: "https://api.ai-pixel.online/v1",
+				apiKey: "sk-openai",
+			});
+			assert.equal(modelProblem(config, "nova"), undefined);
+		},
+	);
+});
+
+test("a provider owns the api shape and an unknown one falls back to openai", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				providers: {
+					nova: { api: "sensenova", baseUrl: "https://nova.example/v1", apiKey: "sk-nova" },
+					broken: { api: "dall-e", baseUrl: "https://broken.example/v1", apiKey: "sk" },
+				},
+				models: {
+					broken: { id: "m-1", provider: "broken" },
+					fine: { id: "m-2", provider: "nova" },
+				},
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.equal(config.providers.broken?.api, "openai");
+			assert.equal(modelApi(config, "broken"), "openai");
+			assert.equal(modelApi(config, "fine"), "sensenova");
+			assert.equal(config.warnings.length, 1);
+			assert.match(config.warnings[0] ?? "", /unknown api/);
+		},
+	);
+});
+
+test("a model that names no provider is never guessed onto an endpoint", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				providers: {
+					"ai-pixel": { baseUrl: "https://api.ai-pixel.online/v1", apiKey: "sk-openai" },
+					sensenova: { api: "sensenova", baseUrl: "https://token.sensenova.cn/v1", apiKey: "sk-nova" },
+				},
+				models: { orphan: { id: "m-1" }, fine: { id: "m-2", provider: "sensenova" } },
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.deepEqual(modelEndpoint(config, "orphan"), { provider: undefined, baseUrl: undefined, apiKey: undefined });
+			assert.match(modelProblem(config, "orphan") ?? "", /model "orphan" names no provider/);
+			assert.equal(modelProblem(config, "fine"), undefined);
+		},
+	);
+});
+
+test("the retired defaultProvider key warns instead of picking an endpoint", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				providers: { only: { baseUrl: "https://only.example/v1", apiKey: "sk" } },
+				defaultProvider: "only",
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.equal(config.warnings.length, 1);
+			assert.match(config.warnings[0] ?? "", /top-level "defaultProvider" is not used/);
+			assert.match(modelProblem(config, "flare") ?? "", /names no provider/);
+		},
+	);
+});
+
+test("a model pointing at an undefined provider warns and is unusable", () => {
+	withAgentDir(
+		{
+			"imagegen.json": {
+				providers: { ok: { baseUrl: "https://ok.example/v1", apiKey: "sk" } },
+				models: {
+					nova: { id: "sensenova-u1.6-lite", provider: "sensenova" },
+					good: { id: "m-2", provider: "ok" },
+				},
+			},
+		},
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.match(config.warnings.join("\n"), /model "nova" uses provider "sensenova", which is not defined/);
+			assert.match(modelProblem(config, "nova") ?? "", /provider "sensenova" is not defined/);
+			assert.equal(modelProblem(config, "good"), undefined);
+			assert.equal(configProblem(config), undefined);
+		},
+	);
+});
+
 test("imageCostUsd bills per image", () => {
 	assert.equal(imageCostUsd(0.02, 1), 0.02);
 	assert.equal(imageCostUsd(0.02, 3), 0.06);
@@ -175,16 +296,22 @@ test("imageCostUsd bills per image", () => {
 	assert.equal(imageCostUsd(Number.NaN, 1), 0);
 });
 
-test("normalizes only the path of a base URL with query parameters", () => {
-	withAgentDir({ "imagegen.json": { baseUrl: "https://example.com/v1///?route=blue/" } }, (dir) => {
-		assert.equal(loadImageGenConfig(dir).baseUrl, "https://example.com/v1?route=blue/");
-	});
+test("normalizes only the path of a provider base URL with query parameters", () => {
+	withAgentDir(
+		{ "imagegen.json": { providers: { p: { baseUrl: "https://example.com/v1///?route=blue/", apiKey: "sk" } } } },
+		(dir) => {
+			assert.equal(loadImageGenConfig(dir).providers.p?.baseUrl, "https://example.com/v1?route=blue/");
+		},
+	);
 });
 
-test("rejects credential-bearing base URLs", () => {
-	withAgentDir({ "imagegen.json": { baseUrl: "https://user:pass@example.com/v1" } }, (dir) => {
-		const config = loadImageGenConfig(dir);
-		assert.equal(config.baseUrl, "");
-		assert.equal(config.warnings.length, 1);
-	});
+test("rejects credential-bearing provider base URLs", () => {
+	withAgentDir(
+		{ "imagegen.json": { providers: { p: { baseUrl: "https://user:pass@example.com/v1", apiKey: "sk" } } } },
+		(dir) => {
+			const config = loadImageGenConfig(dir);
+			assert.equal(config.providers.p, undefined);
+			assert.equal(config.warnings.length, 1);
+		},
+	);
 });

@@ -98,6 +98,19 @@ test("readDimensions handles lossy, lossless and extended WebP headers", () => {
 	assert.equal(readDimensions(webpBytes("VP8X", extended.subarray(0, 8))), undefined);
 });
 
+test("validateSize applies SenseNova rules for the sensenova dialect", () => {
+	for (const size of ["auto", "512x512", "2048x2048", "2720x1536", "1664x2496", "4096x4096"]) {
+		assert.equal(validateSize(size, "sensenova"), undefined, size);
+	}
+	// 512x512 is legal there even though the OpenAI dialect rejects it.
+	assert.match(validateSize("512x512") ?? "", /below/);
+	assert.match(validateSize("1000x1000", "sensenova") ?? "", /multiples of 32/);
+	assert.match(validateSize("256x256", "sensenova") ?? "", /at least 512px/);
+	assert.match(validateSize("4128x4128", "sensenova") ?? "", /4096px maximum edge/);
+	assert.match(validateSize("4096x1024", "sensenova") ?? "", /3:1 aspect ratio/);
+	assert.match(validateSize("bogus", "sensenova") ?? "", /must be/);
+});
+
 function baseRequest(overrides: Partial<ImageRequest> = {}): ImageRequest {
 	return {
 		baseUrl: "https://api.example/v1",
@@ -244,6 +257,80 @@ test("requestImage sends edits as multipart", async () => {
 	assert.equal(url, "https://api.example/v1/images/edits?tenant=blue");
 	assert.equal(isForm, true);
 	assert.deepEqual(fieldNames.sort(), ["complexity", "image", "model", "output_format", "prompt", "quality", "size"]);
+});
+
+test("requestImage posts the SenseNova generation body", async () => {
+	let url: string | undefined;
+	let body: Record<string, unknown> = {};
+	let method: string | undefined;
+	const fetchImpl: typeof fetch = async (input, init) => {
+		url = String(input);
+		method = init?.method;
+		body = JSON.parse(String(init?.body));
+		return Response.json({ data: [{ b64_json: pngBytes(2048, 2048).toString("base64") }] });
+	};
+
+	await requestImage(baseRequest({
+		fetchImpl,
+		api: "sensenova",
+		model: "sensenova-u1.6-lite",
+		size: "2048x2048",
+		quality: undefined,
+		outputFormat: "webp",
+		watermark: false,
+		promptExtend: false,
+		selfCorrection: true,
+	}));
+	assert.equal(method, "POST");
+	assert.equal(url, "https://api.example/v1/images/generations");
+	assert.deepEqual(body, {
+		model: "sensenova-u1.6-lite",
+		prompt: "a red fox",
+		response_format: "b64_json",
+		n: 1,
+		size: "2048x2048",
+		output_format: "webp",
+		watermark: false,
+		prompt_extend: false,
+		self_correction: true,
+	});
+});
+
+test("requestImage turns the SenseNova logo off unless watermark is requested", async () => {
+	const bodies: Record<string, unknown>[] = [];
+	const fetchImpl: typeof fetch = async (_input, init) => {
+		bodies.push(JSON.parse(String(init?.body)));
+		return Response.json({ data: [{ b64_json: pngBytes(8, 8).toString("base64") }] });
+	};
+	await requestImage(baseRequest({ fetchImpl, api: "sensenova", size: "auto" }));
+	await requestImage(baseRequest({ fetchImpl, api: "sensenova", size: "auto", watermark: true }));
+	assert.equal(bodies[0]?.watermark, false);
+	assert.equal(bodies[1]?.watermark, true);
+});
+
+test("requestImage sends SenseNova edits as JSON data URLs and caps references at five", async () => {
+	let isForm = false;
+	let body: Record<string, unknown> = {};
+	const fetchImpl: typeof fetch = async (_input, init) => {
+		isForm = init?.body instanceof FormData;
+		body = JSON.parse(String(init?.body));
+		return Response.json({ data: [{ b64_json: pngBytes(8, 8).toString("base64") }] });
+	};
+	const reference = { data: new Uint8Array(pngBytes(8, 8)), mimeType: "image/png", filename: "ref.png" };
+	await requestImage(baseRequest({ fetchImpl, api: "sensenova", size: "auto", images: [reference], watermark: true }));
+	assert.equal(isForm, false);
+	assert.deepEqual((body.images as { image_url: string }[])[0]!.image_url.startsWith("data:image/png;base64,"), true);
+	assert.equal(body.watermark, true);
+	assert.equal(body.size, "auto");
+
+	await assert.rejects(
+		() => requestImage(baseRequest({
+			fetchImpl,
+			api: "sensenova",
+			images: Array.from({ length: 6 }, () => reference),
+		})),
+		/at most 5 reference images/,
+	);
 });
 
 test("requestImage honours an abort", async () => {

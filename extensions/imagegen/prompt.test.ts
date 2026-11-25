@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { loadImageGenConfig } from "./config.ts";
-import { buildDescription, buildModelArgumentDescription, buildModelMenu, formatResultHeader } from "./prompt.ts";
+import { buildDescription, buildModelArgumentDescription, buildModelMenu, buildSizeArgumentDescription, formatResultHeader } from "./prompt.ts";
 
 const config = {
-	baseUrl: "https://api.example/v1",
-	apiKey: "sk-test",
+	providers: {
+		"ai-pixel": { api: "openai" as const, baseUrl: "https://api.example/v1", apiKey: "sk-test" },
+	},
 	models: {
-		flare: { id: "gpt-image-2.6-flare", description: "Fast drafts." },
-		sunburst: { id: "gpt-image-2.6-sunburst", description: "Careful final assets." },
+		flare: { id: "gpt-image-2.6-flare", provider: "ai-pixel", description: "Fast drafts." },
+		sunburst: { id: "gpt-image-2.6-sunburst", provider: "ai-pixel", description: "Careful final assets." },
 	},
 	defaultModel: "flare",
 	defaultQuality: "medium" as const,
@@ -18,6 +19,16 @@ const config = {
 	timeoutMs: 600_000,
 	warnings: [],
 };
+
+test("size argument description lists the recommended sizes for both dialects", () => {
+	const text = buildSizeArgumentDescription();
+	for (const size of ["1024x1536", "2048x2048", "2720x1536", "1536x2720", "1664x2496", "2496x1664", "4096x4096"]) {
+		assert.match(text, new RegExp(size));
+	}
+	assert.match(text, /multiples of 16/);
+	assert.match(text, /multiples of 32/);
+	assert.match(text, /4K/);
+});
 
 test("model descriptions reach the tool description", () => {
 	const description = buildDescription(config);
@@ -38,6 +49,42 @@ test("config-provided descriptions win over built-in ones", () => {
 	const loaded = loadImageGenConfig("/nonexistent-agent-dir");
 	assert.match(buildModelMenu(loaded), /gpt-image-2\.6-flare/);
 	assert.match(buildModelMenu(loaded), /gpt-image-2\.6-sunburst/);
+});
+
+test("a free SenseNova default is described as the first choice", () => {
+	const description = buildDescription({
+		...config,
+		providers: {
+			...config.providers,
+			sensenova: { api: "sensenova" as const, baseUrl: "https://token.sensenova.cn/v1", apiKey: "sk" },
+		},
+		defaultModel: "nova",
+		models: {
+			...config.models,
+			nova: {
+				id: "sensenova-u1.6-lite",
+				provider: "sensenova",
+				description: "Free native image model.",
+				pricePerImage: 0,
+			},
+		},
+	});
+	assert.match(description, /"nova" is the default and costs nothing/);
+	assert.doesNotMatch(description, /same per-image price/);
+
+	const paid = buildDescription({
+		...config,
+		providers: {
+			...config.providers,
+			sensenova: { api: "sensenova" as const, baseUrl: "https://token.sensenova.cn/v1", apiKey: "sk" },
+		},
+		defaultModel: "nova",
+		models: {
+			...config.models,
+			nova: { id: "sensenova-u1.6-lite", provider: "sensenova", description: "x", pricePerImage: 0.03 },
+		},
+	});
+	assert.doesNotMatch(paid, /costs nothing/);
 });
 
 test("custom model sets skip the flare/sunburst pricing hint", () => {

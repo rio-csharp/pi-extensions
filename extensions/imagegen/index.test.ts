@@ -29,7 +29,14 @@ function setup(t: TestContext) {
 	const cwd = mkdtempSync(join(tmpdir(), "imagegen-job-"));
 	const prior = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = cwd;
-	writeFileSync(join(cwd, "imagegen.json"), JSON.stringify({ baseUrl: "https://image.example/v1", apiKey: "test-key" }));
+	writeFileSync(
+		join(cwd, "imagegen.json"),
+		JSON.stringify({
+			providers: { test: { baseUrl: "https://image.example/v1", apiKey: "test-key" } },
+			models: { flare: { provider: "test", id: "gpt-image-2.6-flare" } },
+			defaultModel: "flare",
+		}),
+	);
 	const tools = new Map<string, TestTool>();
 	let close = () => {};
 	const notice = deferred<{ message: string; level: string }>();

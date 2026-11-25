@@ -1,28 +1,29 @@
-import { PRESET_SIZES } from "./config.ts";
+import type { ImageApi } from "./config.ts";
+import { openai } from "./dialects/openai.ts";
+import { sensenova } from "./dialects/sensenova.ts";
+import type { Dialect, DialectRequest, ReferenceImage } from "./dialects/types.ts";
 
-export const MAX_EDGE = 3840;
-export const MIN_PIXELS = 655_360;
-export const MAX_PIXELS = 8_294_400;
+export type { ReferenceImage } from "./dialects/types.ts";
 
-export interface ReferenceImage {
-	data: Uint8Array;
-	mimeType: string;
-	filename: string;
+/** Every dialect this extension can speak, keyed by the `api` value used in imagegen.json. */
+export const DIALECTS: Record<ImageApi, Dialect> = { openai, sensenova };
+
+/** Arguments that belong to exactly one dialect; the rest are shared by all of them. */
+export const DIALECT_ARGUMENTS = Object.values(DIALECTS).flatMap((dialect) => dialect.arguments);
+
+/** Largest reference count any configured dialect accepts, for the tool schema. */
+export const MAX_REFERENCE_IMAGES = Math.max(...Object.values(DIALECTS).map((dialect) => dialect.maxReferenceImages));
+
+/** Look up one dialect; unknown values fall back to the OpenAI shape. */
+export function dialectOf(api: ImageApi | undefined): Dialect {
+	return (api && DIALECTS[api]) || openai;
 }
 
-export interface ImageRequest {
+export interface ImageRequest extends DialectRequest {
 	baseUrl: string;
 	apiKey: string;
-	model: string;
-	prompt: string;
-	size?: string;
-	quality?: string;
-	background?: string;
-	outputFormat?: string;
-	outputCompression?: number;
-	moderation?: string;
-	complexity?: string;
-	images?: ReferenceImage[];
+	/** Request shape; defaults to "openai". */
+	api?: ImageApi;
 	timeoutMs: number;
 	signal?: AbortSignal;
 	/** Test seam. */
@@ -59,25 +60,9 @@ export class ImageRequestError extends Error {
 	}
 }
 
-/** Validate an image `size` value against the documented presets and custom-size limits. */
-export function validateSize(size: string): string | undefined {
-	const value = size.trim();
-	if (value === "auto") return undefined;
-	if ((PRESET_SIZES as readonly string[]).includes(value)) return undefined;
-	const match = /^(\d{2,5})x(\d{2,5})$/.exec(value);
-	if (!match) {
-		return `size must be "auto", one of ${PRESET_SIZES.join(", ")}, or WIDTHxHEIGHT (got "${value}")`;
-	}
-	const width = Number(match[1]);
-	const height = Number(match[2]);
-	if (width % 16 !== 0 || height % 16 !== 0) return `size ${value} must use multiples of 16`;
-	if (width > MAX_EDGE || height > MAX_EDGE) return `size ${value} exceeds the ${MAX_EDGE}px maximum edge`;
-	const ratio = Math.max(width, height) / Math.min(width, height);
-	if (ratio > 3) return `size ${value} exceeds the 3:1 aspect ratio limit`;
-	const pixels = width * height;
-	if (pixels < MIN_PIXELS) return `size ${value} is below ${MIN_PIXELS} pixels`;
-	if (pixels > MAX_PIXELS) return `size ${value} exceeds ${MAX_PIXELS} pixels`;
-	return undefined;
+/** Validate an image `size` value against the rules of the selected image API. */
+export function validateSize(size: string, api: ImageApi = "openai"): string | undefined {
+	return dialectOf(api).validateSize(size);
 }
 
 /** Identify the real image format from its magic bytes; the API may ignore output_format. */
@@ -157,46 +142,6 @@ export function readDimensions(bytes: Uint8Array): { width: number; height: numb
 		}
 	}
 	return sniffMimeType(bytes) === "image/webp" ? readWebpDimensions(view) : undefined;
-}
-
-function fieldValue(value: string | number | undefined): string | undefined {
-	if (value === undefined) return undefined;
-	return String(value);
-}
-
-function buildJsonBody(request: ImageRequest): Record<string, unknown> {
-	const body: Record<string, unknown> = {
-		model: request.model,
-		prompt: request.prompt,
-	};
-	const size = fieldValue(request.size);
-	if (size) body.size = size;
-	if (request.quality) body.quality = request.quality;
-	if (request.background) body.background = request.background;
-	if (request.outputFormat) body.output_format = request.outputFormat;
-	if (request.outputCompression !== undefined) body.output_compression = request.outputCompression;
-	if (request.moderation) body.moderation = request.moderation;
-	if (request.complexity) body.complexity = request.complexity;
-	return body;
-}
-
-function buildEditForm(request: ImageRequest): FormData {
-	const form = new FormData();
-	form.set("model", request.model);
-	form.set("prompt", request.prompt);
-	const size = fieldValue(request.size);
-	if (size) form.set("size", size);
-	if (request.quality) form.set("quality", request.quality);
-	if (request.background) form.set("background", request.background);
-	if (request.outputFormat) form.set("output_format", request.outputFormat);
-	if (request.outputCompression !== undefined) form.set("output_compression", String(request.outputCompression));
-	if (request.moderation) form.set("moderation", request.moderation);
-	if (request.complexity) form.set("complexity", request.complexity);
-	for (const image of request.images ?? []) {
-		const bytes = new Uint8Array(image.data);
-		form.append("image", new Blob([bytes], { type: image.mimeType }), image.filename);
-	}
-	return form;
 }
 
 function requestIdOf(response: Response): string | undefined {
@@ -288,16 +233,23 @@ function delay(ms: number, signal?: AbortSignal): Promise<void> {
 /** POST one generation or edit request, retrying transient provider failures. */
 export async function requestImage(request: ImageRequest): Promise<ImageResponse> {
 	if (request.signal?.aborted) throw new ImageRequestError("aborted");
+	const dialect = dialectOf(request.api);
 	if (request.size !== undefined) {
 		const size = request.size.trim();
-		const problem = validateSize(size);
+		const problem = dialect.validateSize(size);
 		if (problem) throw new ImageRequestError(problem);
 		request = { ...request, size };
+	}
+	if ((request.images?.length ?? 0) > dialect.maxReferenceImages) {
+		throw new ImageRequestError(
+			`${dialect.label} accepts at most ${dialect.maxReferenceImages} reference images`,
+		);
 	}
 
 	const fetchImpl = request.fetchImpl ?? fetch;
 	const retryBaseDelay = request.retryBaseDelayMs ?? BASE_DELAY_MS;
 	const editing = (request.images?.length ?? 0) > 0;
+	const payload = dialect.build(request);
 	let endpoint: URL;
 	try {
 		endpoint = new URL(request.baseUrl);
@@ -329,10 +281,10 @@ export async function requestImage(request: ImageRequest): Promise<ImageResponse
 		try {
 			response = await fetchImpl(endpoint, {
 				method: "POST",
-				headers: editing
+				headers: payload.multipart
 					? { authorization: `Bearer ${request.apiKey}` }
 					: { authorization: `Bearer ${request.apiKey}`, "content-type": "application/json" },
-				body: editing ? buildEditForm(request) : JSON.stringify(buildJsonBody(request)),
+				body: payload.multipart ? payload.body as FormData : JSON.stringify(payload.body),
 				signal,
 			});
 		} catch (error) {
@@ -359,15 +311,15 @@ export async function requestImage(request: ImageRequest): Promise<ImageResponse
 			);
 		}
 		checkAbort();
-		let payload: unknown;
+		let parsedBody: unknown;
 		try {
-			payload = text === "" ? undefined : JSON.parse(text);
+			parsedBody = text === "" ? undefined : JSON.parse(text);
 		} catch {
-			payload = undefined;
+			parsedBody = undefined;
 		}
 
 		if (!response.ok) {
-			const detail = errorMessage(payload, text);
+			const detail = errorMessage(parsedBody, text);
 			const requestId = requestIdOf(response);
 			const suffix = requestId ? ` (request id ${requestId})` : "";
 			lastError = new ImageRequestError(
@@ -380,8 +332,8 @@ export async function requestImage(request: ImageRequest): Promise<ImageResponse
 			continue;
 		}
 
-		if (payload === undefined) throw new ImageRequestError("response is not valid JSON");
-		const parsed = parsePayload(payload);
+		if (parsedBody === undefined) throw new ImageRequestError("response is not valid JSON");
+		const parsed = parsePayload(parsedBody);
 		return { ...parsed, attempts: attempt };
 	}
 
